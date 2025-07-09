@@ -1,37 +1,103 @@
 local Players = game:GetService("Players")
 local StarterGui = game:GetService("StarterGui")
+local TweenService = game:GetService("TweenService")
 local plr = Players.LocalPlayer
 local folder = workspace:WaitForChild("chests")
 
-local enabled = false
-local running = true
+-- config
+local keywords = {"chest", "crate"}
+local mode = 1
+local modeNames = {"Normal", "Tween", "Instant"}
 local delayTime = 0.2
+
+-- states
+local enabledCollect = false
+local enabledOpen = false
+local running = true
+local childConn = nil
 local hrp
 
--- update character and hrp each respawn
+-- init char
 local function setupChar(char)
-    hrp = char:WaitForChild("HumanoidRootPart",5)
+	hrp = char:WaitForChild("HumanoidRootPart", 5)
 end
 plr.CharacterAdded:Connect(setupChar)
 setupChar(plr.Character or plr.CharacterAdded:Wait())
 
--- ui
+-- utils
+local function hasKeyword(str)
+	str = str:lower()
+	for _, word in ipairs(keywords) do
+		if str:find(word) then return true end
+	end
+end
+
+local function tryOpenWithTools()
+	if not enabledOpen then return end
+	for _, k in ipairs(keywords) do
+		for _, tool in ipairs(plr.Backpack:GetChildren()) do
+			if tool:IsA("Tool") and tool.Name:lower():find(k) then
+				tool.Parent = plr.Character
+				task.wait()
+				pcall(function() tool:Activate() end)
+			end
+		end
+		if plr.Character then
+			for _, tool in ipairs(plr.Character:GetChildren()) do
+				if tool:IsA("Tool") and tool.Name:lower():find(k) then
+					pcall(function() tool:Activate() end)
+				end
+			end
+		end
+	end
+end
+
+local function processChest(chest)
+	if not enabledCollect or not running or not hrp then return end
+	if hasKeyword(chest.Name) then
+		local p = chest:FindFirstChildWhichIsA("ProximityPrompt")
+		if not p then return end
+
+		if mode == 2 then
+			TweenService:Create(hrp, TweenInfo.new(0.2), {CFrame = chest.CFrame}):Play()
+			task.wait(0.25)
+		else
+			pcall(function() hrp.CFrame = chest.CFrame end)
+			if mode == 1 then task.wait(0.15) end
+		end
+		fireproximityprompt(p)
+		tryOpenWithTools()
+		if mode == 1 then task.wait(delayTime)
+		elseif mode == 2 then task.wait(delayTime * 0.5) end
+	end
+end
+
+-- gui
 local gui = Instance.new("ScreenGui", plr:WaitForChild("PlayerGui"))
 gui.ResetOnSpawn = false
 
 local frame = Instance.new("Frame", gui)
-frame.Size = UDim2.new(0.3,0,0.3,0)
-frame.Position = UDim2.new(0.35,0,0.35,0)
+frame.Size = UDim2.new(0.22,0,0.3,0)
+frame.Position = UDim2.new(0.39,0,0.36,0)
 frame.BackgroundColor3 = Color3.fromRGB(45,45,45)
 frame.Active = true
 frame.Draggable = true
 
-local dragBar = Instance.new("Frame", frame)
-dragBar.Size = UDim2.new(1,0,0.2,0)
-dragBar.Position = UDim2.new(0,0,0,0)
-dragBar.BackgroundColor3 = Color3.fromRGB(30,30,30)
-dragBar.BorderSizePixel = 0
+local function makeBtn(text, posY)
+	local btn = Instance.new("TextButton", frame)
+	btn.Size = UDim2.new(1,0,0.15,0)
+	btn.Position = UDim2.new(0,0,posY,0)
+	btn.BackgroundColor3 = Color3.fromRGB(100,0,0)
+	btn.TextColor3 = Color3.new(1,1,1)
+	btn.Font = Enum.Font.SourceSansBold
+	btn.TextScaled = true
+	btn.Text = text
+	return btn
+end
 
+local dragBar = Instance.new("Frame", frame)
+dragBar.Size = UDim2.new(1,0,0.15,0)
+dragBar.BackgroundColor3 = Color3.fromRGB(30,30,30)
 local credit = Instance.new("TextLabel", dragBar)
 credit.Size = UDim2.new(1,0,1,0)
 credit.BackgroundTransparency = 1
@@ -41,94 +107,85 @@ credit.TextStrokeTransparency = 0
 credit.Font = Enum.Font.SourceSansBold
 credit.TextScaled = true
 
-local toggle = Instance.new("TextButton", frame)
-toggle.Size = UDim2.new(1,0,0.2,0)
-toggle.Position = UDim2.new(0,0,0.25,0)
-toggle.BackgroundColor3 = Color3.fromRGB(60,60,60)
-toggle.TextColor3 = Color3.new(1,1,1)
-toggle.Font = Enum.Font.SourceSansBold
-toggle.TextScaled = true
-toggle.Text = "Enable Auto Open"
-
+local modeBtn = makeBtn("Mode: "..modeNames[mode], 0.17)
+local collectBtn = makeBtn("Enable Auto Collect", 0.34)
+local openBtn = makeBtn("Enable Auto Open", 0.51)
 local delayBox = Instance.new("TextBox", frame)
-delayBox.Size = UDim2.new(1,0,0.2,0)
-delayBox.Position = UDim2.new(0,0,0.5,0)
+delayBox.Size = UDim2.new(1,0,0.15,0)
+delayBox.Position = UDim2.new(0,0,0.68,0)
 delayBox.BackgroundColor3 = Color3.fromRGB(50,50,50)
 delayBox.TextColor3 = Color3.new(1,1,1)
 delayBox.Font = Enum.Font.SourceSans
 delayBox.TextScaled = true
-delayBox.PlaceholderText = "delay (sec)..."
+delayBox.PlaceholderText = "Delay (sec)..."
 delayBox.Text = tostring(delayTime)
 
-local destroy = Instance.new("TextButton", frame)
-destroy.Size = UDim2.new(1,0,0.2,0)
-destroy.Position = UDim2.new(0,0,0.75,0)
-destroy.BackgroundColor3 = Color3.fromRGB(80,0,0)
-destroy.TextColor3 = Color3.new(1,1,1)
-destroy.Font = Enum.Font.SourceSansBold
-destroy.TextScaled = true
-destroy.Text = "Destroy UI"
+local destroyBtn = makeBtn("Destroy UI", 0.85)
+destroyBtn.BackgroundColor3 = Color3.fromRGB(120, 0, 0)
 
-toggle.MouseButton1Click:Connect(function()
-    enabled = not enabled
-    toggle.Text = enabled and "Disable Auto Open" or "Enable Auto Open"
-    -- reset hrp if needed
-    if enabled and (not hrp or not hrp.Parent) then
-        setupChar(plr.Character)
-    end
+-- button logic
+modeBtn.MouseButton1Click:Connect(function()
+	mode = mode % #modeNames + 1
+	modeBtn.Text = "Mode: "..modeNames[mode]
 end)
 
-delayBox.FocusLost:Connect(function(enter)
-    local v = tonumber(delayBox.Text)
-    if v and v >= 0 then delayTime = v else delayBox.Text = tostring(delayTime) end
+collectBtn.MouseButton1Click:Connect(function()
+	enabledCollect = not enabledCollect
+	collectBtn.Text = enabledCollect and "Disable Auto Collect" or "Enable Auto Collect"
+	collectBtn.BackgroundColor3 = enabledCollect and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(100,0,0)
+
+	if enabledCollect then
+		if not hrp or not hrp.Parent then setupChar(plr.Character) end
+		hrp.Anchored = true
+
+		-- initial run
+		for _, chest in ipairs(folder:GetChildren()) do
+			task.spawn(function() processChest(chest) end)
+		end
+
+		childConn = folder.ChildAdded:Connect(function(obj)
+			task.spawn(function() processChest(obj) end)
+		end)
+	else
+		if childConn then childConn:Disconnect() childConn = nil end
+		if hrp then hrp.Anchored = false end
+	end
 end)
 
-destroy.MouseButton1Click:Connect(function()
-    running = false
-    gui:Destroy()
+openBtn.MouseButton1Click:Connect(function()
+	enabledOpen = not enabledOpen
+	openBtn.Text = enabledOpen and "Disable Auto Open" or "Enable Auto Open"
+	openBtn.BackgroundColor3 = enabledOpen and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(100,0,0)
 end)
 
--- chest loop
-task.spawn(function()
-    while running do
-        if enabled and hrp and hrp.Parent then
-            for _, chest in ipairs(folder:GetChildren()) do
-                if not running or not enabled then break end
-                if chest.Name:lower():match("chest$") then
-                    local p = chest:FindFirstChildWhichIsA("ProximityPrompt")
-                    if p then
-                        pcall(function() hrp.CFrame = chest.CFrame end)
-                        task.wait(0.15)
-                        fireproximityprompt(p)
-                        task.wait(delayTime)
-                    end
-                end
-            end
-        else
-            task.wait(0.5)
-        end
-    end
+delayBox.FocusLost:Connect(function()
+	local v = tonumber(delayBox.Text)
+	if v and v >= 0 then delayTime = v else delayBox.Text = tostring(delayTime) end
 end)
 
--- notification using BindableFunction callback (notif callbacks require BindableFunction) :contentReference[oaicite:5]{index=5}
+destroyBtn.MouseButton1Click:Connect(function()
+	running = false
+	if childConn then childConn:Disconnect() end
+	if hrp then hrp.Anchored = false end
+	gui:Destroy()
+end)
+
+-- notification
 local bf = Instance.new("BindableFunction")
 function bf.OnInvoke(choice)
-    if choice == "Yes" then
-        pcall(function() toclipboard("https://discord.gg/T7NjmUgZcm") end)
-        StarterGui:SetCore("SendNotification", {
-            Title = "Copied!";
-            Text = "Copied discord invite link! Paste it in your browser";
-            Duration = 5;
-        })
-    end
+	if choice == "Yes" then
+		pcall(function() toclipboard("https://discord.gg/T7NjmUgZcm") end)
+		StarterGui:SetCore("SendNotification", {
+			Title="Copied!";
+			Text="Copied discord invite link! Paste it in browser";
+			Duration=5;
+		})
+	end
 end
-
 StarterGui:SetCore("SendNotification", {
-    Title = "Thanks for using my script!";
-    Text = "Join my discord server please";
-    Duration = 8;
-    Button1 = "Yes";
-    Button2 = "No";
-    Callback = bf;
+	Title="Thanks for using my script!";
+	Text="Join my discord server please";
+	Duration=8;
+	Button1="Yes"; Button2="No";
+	Callback=bf;
 })
-
