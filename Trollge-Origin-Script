@@ -1,248 +1,159 @@
 local Players = game:GetService("Players")
 local StarterGui = game:GetService("StarterGui")
-local TweenService = game:GetService("TweenService")
 local plr = Players.LocalPlayer
 local folder = workspace:WaitForChild("chests")
 
--- config
-local keywords = {"chest", "crate"}
-local mode = 1
-local modeNames = {"Normal", "Tween", "Instant"}
-local delayTime = 0.2
-
--- states
-local enabledCollect = false
-local enabledOpen = false
-local highlightEnabled = false
+-- Settings
+local enabled = false
 local running = true
-local childConn = nil
-local highlights = {}
+local delayTime = 0.2
 local hrp
 
--- init char
-local function setupChar(char)
+-- Update character
+local function updateCharacter()
+	local char = plr.Character or plr.CharacterAdded:Wait()
 	hrp = char:WaitForChild("HumanoidRootPart", 5)
 end
-plr.CharacterAdded:Connect(setupChar)
-setupChar(plr.Character or plr.CharacterAdded:Wait())
+updateCharacter()
+plr.CharacterAdded:Connect(updateCharacter)
 
--- utils
-local function hasKeyword(str)
-	str = str:lower()
-	for _, word in ipairs(keywords) do
-		if str:find(word) then return true end
-	end
-end
-
-local function notify(title, text, duration)
+-- Notification shortcut
+local function notify(title, text)
 	pcall(function()
 		StarterGui:SetCore("SendNotification", {
 			Title = title,
 			Text = text,
-			Duration = duration or 5
+			Duration = 5
 		})
 	end)
 end
 
-local function tryOpenWithTools()
-	if not enabledOpen then return end
-	for _, k in ipairs(keywords) do
-		for _, tool in ipairs(plr.Backpack:GetChildren()) do
-			if tool:IsA("Tool") and tool.Name:lower():find(k) then
-				tool.Parent = plr.Character
-				task.wait()
-				pcall(function() tool:Activate() end)
-			end
-		end
-		if plr.Character then
-			for _, tool in ipairs(plr.Character:GetChildren()) do
-				if tool:IsA("Tool") and tool.Name:lower():find(k) then
-					pcall(function() tool:Activate() end)
-				end
-			end
-		end
-	end
-end
+-- UI Setup
+local screenGui = Instance.new("ScreenGui", plr:WaitForChild("PlayerGui"))
+screenGui.Name = "ChestAutoUI"
+screenGui.ResetOnSpawn = false
 
-local function highlightChest(obj)
-	if not highlightEnabled then return end
-	if highlights[obj] then return end
-	local h = Instance.new("Highlight")
-	h.FillColor = Color3.fromRGB(255, 255, 0)
-	h.FillTransparency = 0.5
-	h.OutlineTransparency = 1
-	h.Adornee = obj
-	h.Parent = obj
-	highlights[obj] = h
-end
+local mainFrame = Instance.new("Frame", screenGui)
+mainFrame.Size = UDim2.new(0, 200, 0, 140)
+mainFrame.Position = UDim2.new(0, 20, 0, 100)
+mainFrame.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
 
-local function clearHighlights()
-	for obj, h in pairs(highlights) do
-		if h and h.Parent then h:Destroy() end
-	end
-	highlights = {}
-end
+local dragBar = Instance.new("Frame", mainFrame)
+dragBar.Size = UDim2.new(1, 0, 0, 25)
+dragBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+dragBar.BorderSizePixel = 0
 
-local function processChest(chest)
-	if not enabledCollect or not running or not hrp then return end
-	if hasKeyword(chest.Name) then
-		local p = chest:FindFirstChildWhichIsA("ProximityPrompt")
-		if not p then return end
-		highlightChest(chest)
+local creditLabel = Instance.new("TextLabel", dragBar)
+creditLabel.Size = UDim2.new(1, 0, 1, 0)
+creditLabel.BackgroundTransparency = 1
+creditLabel.Text = "By : @dexploitz on YT"
+creditLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+creditLabel.TextStrokeTransparency = 0
+creditLabel.Font = Enum.Font.SourceSansBold
+creditLabel.TextScaled = true
 
-		-- anchor during move
-		hrp.Anchored = true
+local toggleBtn = Instance.new("TextButton", mainFrame)
+toggleBtn.Size = UDim2.new(1, -20, 0, 30)
+toggleBtn.Position = UDim2.new(0, 10, 0, 35)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.Font = Enum.Font.SourceSansBold
+toggleBtn.TextSize = 18
+toggleBtn.Text = "Enable Auto Collect"
 
-		if mode == 2 then
-			TweenService:Create(hrp, TweenInfo.new(0.2), {CFrame = chest.CFrame}):Play()
-			task.wait(0.25)
-		else
-			pcall(function() hrp.CFrame = chest.CFrame end)
-			if mode == 1 then task.wait(0.15) end
-		end
-		fireproximityprompt(p)
-		tryOpenWithTools()
-		if mode == 1 then task.wait(delayTime)
-		elseif mode == 2 then task.wait(delayTime * 0.5) end
-
-		hrp.Anchored = false
-	end
-end
-
--- gui
-local gui = Instance.new("ScreenGui", plr:WaitForChild("PlayerGui"))
-gui.ResetOnSpawn = false
-
-local frame = Instance.new("Frame", gui)
-frame.Size = UDim2.new(0.22,0,0.4,0)
-frame.Position = UDim2.new(0.39,0,0.33,0)
-frame.BackgroundColor3 = Color3.fromRGB(45,45,45)
-frame.Active = true
-frame.Draggable = true
-
-local function makeBtn(text, posY, gray)
-	local btn = Instance.new("TextButton", frame)
-	btn.Size = UDim2.new(1,0,0.12,0)
-	btn.Position = UDim2.new(0,0,posY,0)
-	btn.BackgroundColor3 = gray and Color3.fromRGB(60,60,60) or Color3.fromRGB(100,0,0)
-	btn.TextColor3 = Color3.new(1,1,1)
-	btn.Font = Enum.Font.SourceSansBold
-	btn.TextScaled = true
-	btn.Text = text
-	return btn
-end
-
-local dragBar = Instance.new("Frame", frame)
-dragBar.Size = UDim2.new(1,0,0.12,0)
-dragBar.BackgroundColor3 = Color3.fromRGB(30,30,30)
-local credit = Instance.new("TextLabel", dragBar)
-credit.Size = UDim2.new(1,0,1,0)
-credit.BackgroundTransparency = 1
-credit.Text = "By : @dexploitz on YT"
-credit.TextColor3 = Color3.new(1,1,1)
-credit.TextStrokeTransparency = 0
-credit.Font = Enum.Font.SourceSansBold
-credit.TextScaled = true
-
-local modeBtn = makeBtn("Mode: "..modeNames[mode], 0.13, true)
-local collectBtn = makeBtn("Enable Auto Collect", 0.26)
-local openBtn = makeBtn("Enable Auto Open", 0.39)
-local highlightBtn = makeBtn("Highlight Chests (Off)", 0.52)
-
-local delayBox = Instance.new("TextBox", frame)
-delayBox.Size = UDim2.new(1,0,0.12,0)
-delayBox.Position = UDim2.new(0,0,0.65,0)
-delayBox.BackgroundColor3 = Color3.fromRGB(50,50,50)
-delayBox.TextColor3 = Color3.new(1,1,1)
+local delayBox = Instance.new("TextBox", mainFrame)
+delayBox.Size = UDim2.new(1, -20, 0, 25)
+delayBox.Position = UDim2.new(0, 10, 0, 70)
+delayBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+delayBox.TextColor3 = Color3.fromRGB(255, 255, 255)
 delayBox.Font = Enum.Font.SourceSans
-delayBox.TextScaled = true
+delayBox.TextSize = 16
 delayBox.PlaceholderText = "Delay (sec)..."
 delayBox.Text = tostring(delayTime)
 
-local destroyBtn = makeBtn("Destroy UI", 0.78)
-destroyBtn.BackgroundColor3 = Color3.fromRGB(120, 0, 0)
+local destroyBtn = Instance.new("TextButton", mainFrame)
+destroyBtn.Size = UDim2.new(1, -20, 0, 25)
+destroyBtn.Position = UDim2.new(0, 10, 0, 105)
+destroyBtn.BackgroundColor3 = Color3.fromRGB(80, 0, 0)
+destroyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+destroyBtn.Font = Enum.Font.SourceSansBold
+destroyBtn.TextSize = 16
+destroyBtn.Text = "Destroy UI"
 
--- button logic
-modeBtn.MouseButton1Click:Connect(function()
-	mode = mode % #modeNames + 1
-	modeBtn.Text = "Mode: "..modeNames[mode]
+-- Toggle logic
+toggleBtn.MouseButton1Click:Connect(function()
+	enabled = not enabled
+	toggleBtn.Text = enabled and "Disable Auto Collect" or "Enable Auto Collect"
 end)
 
-collectBtn.MouseButton1Click:Connect(function()
-	enabledCollect = not enabledCollect
-	collectBtn.Text = enabledCollect and "Disable Auto Collect" or "Enable Auto Collect"
-	collectBtn.BackgroundColor3 = enabledCollect and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(100,0,0)
-
-	if enabledCollect then
-		if not hrp or not hrp.Parent then setupChar(plr.Character) end
-
-		local found = false
-		for _, chest in ipairs(folder:GetChildren()) do
-			if hasKeyword(chest.Name) then
-				found = true
-				task.spawn(function() processChest(chest) end)
-			end
-		end
-		if not found then
-			notify("No Chests", "No chests or crates found!", 6)
-		end
-
-		childConn = folder.ChildAdded:Connect(function(obj)
-			if hasKeyword(obj.Name) then
-				processChest(obj)
-			end
-		end)
-	else
-		if childConn then childConn:Disconnect() childConn = nil end
-		if hrp then hrp.Anchored = false end
-	end
-end)
-
-openBtn.MouseButton1Click:Connect(function()
-	enabledOpen = not enabledOpen
-	openBtn.Text = enabledOpen and "Disable Auto Open" or "Enable Auto Open"
-	openBtn.BackgroundColor3 = enabledOpen and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(100,0,0)
-end)
-
-highlightBtn.MouseButton1Click:Connect(function()
-	highlightEnabled = not highlightEnabled
-	highlightBtn.Text = highlightEnabled and "Highlight Chests (On)" or "Highlight Chests (Off)"
-	highlightBtn.BackgroundColor3 = highlightEnabled and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(100,0,0)
-
-	if not highlightEnabled then
-		clearHighlights()
-	else
-		for _, obj in ipairs(folder:GetChildren()) do
-			if hasKeyword(obj.Name) then highlightChest(obj) end
-		end
-	end
-end)
-
+-- Delay logic
 delayBox.FocusLost:Connect(function()
-	local v = tonumber(delayBox.Text)
-	if v and v >= 0 then delayTime = v else delayBox.Text = tostring(delayTime) end
+	local val = tonumber(delayBox.Text)
+	if val and val >= 0 then
+		delayTime = val
+	else
+		delayBox.Text = tostring(delayTime)
+	end
 end)
 
+-- Destroy UI
 destroyBtn.MouseButton1Click:Connect(function()
 	running = false
-	if childConn then childConn:Disconnect() end
-	clearHighlights()
-	if hrp then hrp.Anchored = false end
-	gui:Destroy()
+	screenGui:Destroy()
 end)
 
--- startup notification
-local bf = Instance.new("BindableFunction")
-function bf.OnInvoke(choice)
-	if choice == "Yes" then
-		pcall(function() toclipboard("https://discord.gg/T7NjmUgZcm") end)
-		notify("Copied!", "Copied discord invite link! Paste it in browser", 5)
+-- Chest search and collect logic
+task.spawn(function()
+	while running do
+		if enabled and hrp then
+			local chests = folder:GetChildren()
+			local foundAny = false
+
+			for _, obj in ipairs(chests) do
+				if not running or not enabled then break end
+
+				local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt")
+				if prompt and obj:IsA("BasePart") or obj:IsA("Model") then
+					foundAny = true
+
+					-- Move to it
+					pcall(function()
+						hrp.CFrame = obj:IsA("Model") and obj:GetModelCFrame() or obj.CFrame
+					end)
+					task.wait(0.15)
+
+					-- Retry until object disappears or max attempts
+					local tries = 0
+					while obj.Parent and tries < 15 do
+						local ok, err = pcall(function()
+							fireproximityprompt(prompt)
+						end)
+						if not ok then
+							notify("Error", "Prompt failed: " .. tostring(err))
+						end
+						tries += 1
+						task.wait(0.3)
+					end
+
+					task.wait(delayTime)
+				end
+			end
+
+			if not foundAny then
+				notify("No Targets", "No objects with ProximityPrompt found.")
+				task.wait(2)
+			end
+		else
+			task.wait(0.5)
+		end
 	end
-end
-StarterGui:SetCore("SendNotification", {
-	Title = "Thanks for using my script!";
-	Text = "Join my discord server please";
-	Duration = 8;
-	Button1 = "Yes"; Button2 = "No";
-	Callback = bf;
-})
+end)
+
+-- First notification
+notify("Thanks for using my script!", "Join my Discord server please!")
+pcall(function()
+     toclipboard("https://discord.gg/T7NjmUgZcm")
+end)
