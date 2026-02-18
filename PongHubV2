@@ -51,22 +51,24 @@ local autoSpeedEnabled   = false
 local autoVipEnabled     = false
 local autoBossEnabled    = false
 local scriptDestroyed    = false
-local abortTasks         = false -- Flag to stop one-time actions
+local abortTasks         = false
 
 -- Settings
-local autoPickUpRarity   = "Divine"
-local autoPickUpMutation = "All"
-local pickUpMethod       = "FireProximity"
-local pickUpReturn       = "Last Position" -- "Last Position" or "Plot Spawn"
-local actionDelay        = 0.5             -- Time between actions
-local carryAmount        = 1              -- How many items to carry before going to platform
-local bossDistance       = 6              -- Studs above boss head during fight
+-- Multi-select: empty table = "All", otherwise only those in the set match
+local autoPickUpRarities  = {}        -- {} means All
+local autoPickUpMutations = {}        -- {} means All
+local pickUpMethod        = "FireProximity"
+local pickUpReturn        = "Last Position"
+local actionDelay         = 0.5
+local carryAmount         = 1
+local bossDistance        = 6
 
 -- Sell Settings
-local sellType           = "Equipped"
-local sellCustomMutation = "All"
-local sellCustomRarity   = "All"
-local sellCustomLevel    = ""
+local sellType             = "Equipped"
+local sellCustomMutations  = {}       -- {} means All
+local sellCustomRarities   = {}       -- {} means All
+local sellCustomLevel      = ""
+local sellTeleportDelay    = 0.3     -- seconds to wait after teleporting before firing sell
 
 local autoCollectThread  = nil
 local autoDestroyThread  = nil
@@ -76,6 +78,26 @@ local autoSellThread     = nil
 local autoSpeedThread    = nil
 local autoVipThread      = nil
 local autoBossThread     = nil
+
+-- ============================================================
+--  INTRUDER ALERT STATE
+-- ============================================================
+
+local intruderAlertEnabled    = true   -- Can be toggled in Misc tab
+local intruderDetectMethod    = "Touch" -- "Touch" or "Proximity"
+local intruderProximityDist   = 15     -- studs radius for proximity mode
+local autoKillIntruderEnabled = false
+local autoKillIntruderThread  = nil
+local proximityThread         = nil
+
+-- Track players currently on the plot and when they arrived
+-- { [player] = { timer = number, alerted = bool, highlight = Instance, billboard = Instance, timerConn = RBXScriptConnection } }
+local intruderData = {}
+local intruderConnections = {} -- touch connections per plot part
+
+local INTRUDER_LINGER_TIME  = 5   -- seconds before alert triggers
+local INTRUDER_CLOSE_DIST   = 20  -- studs: billboard hidden when this close
+local AUTOKILL_DIST         = 1   -- stud radius for auto kill
 
 -- ============================================================
 --  PLATFORM & UTILS
@@ -90,7 +112,7 @@ local function getSafePlatform()
         p.Size = Vector3.new(2048, 1, 2048)
         p.Position = Vector3.new(-114, 0, -478)
         p.Anchored = true
-        p.Transparency = 1 -- Invisible
+        p.Transparency = 1
         p.CanCollide = true
         p.Parent = workspace
     end
@@ -127,7 +149,6 @@ end
 --  CORE FUNCTIONS
 -- ============================================================
 
--- DESTROY WAVES
 local function destroyWaves()
     if not tsunamisFolder or not wackyWavesFolder then return 0 end
     local n = 0
@@ -140,7 +161,6 @@ local function destroyWaves()
     return n
 end
 
--- DESTROY VIP DOORS
 local function destroyVipDoors()
     local n = 0
     if VIPDoors then
@@ -156,7 +176,6 @@ local function destroyVipDoors()
     return n
 end
 
--- COLLECT ALL
 local function collectAll()
     abortTasks = false
     if not plot then warn("No plot found."); return 0 end
@@ -165,64 +184,63 @@ local function collectAll()
     if not hrp then return 0 end
 
     for _, t in ipairs(plot:GetDescendants()) do
-        if abortTasks then break end -- Stop check
+        if abortTasks then break end
         if t.Name == "CollectTouch" then
             local pl = t:FindFirstChild("CollectGUI")
                 and t.CollectGUI:FindFirstChild("CollectFrame")
                 and t.CollectGUI.CollectFrame:FindFirstChild("Price")
             if pl then total += abbreviate(pl.Text, true) end
-            
             firetouchinterest(hrp, t, 0)
             task.wait(0.05)
             firetouchinterest(hrp, t, 1)
-            task.wait(actionDelay / 5) -- Small delay for collection
+            task.wait(actionDelay / 5)
         end
     end
     return total
 end
 
--- Helper: count CarryModel children on head
 local function countCarried(head)
     if not head then return 0 end
     local count = 0
     for _, child in ipairs(head:GetChildren()) do
-        if child.Name:find("CarryModel") then
-            count += 1
-        end
+        if child.Name:find("CarryModel") then count += 1 end
     end
     return count
 end
 
--- Helper: wait until carried items drop to zero or timeout
 local function waitUntilDropped(head, maxWait)
     maxWait = maxWait or 5
     local elapsed = 0
     while countCarried(head) > 0 and elapsed < maxWait do
-        task.wait(0.1)
-        elapsed += 0.1
+        task.wait(0.1); elapsed += 0.1
     end
 end
 
--- PICK UP ITEMS (with Carry Amount support)
-local function pickUp(rarity, mutation)
+local function pickUp(rarities, mutations)
     abortTasks = false
     if not ItemSpawners then return 0 end
-    rarity   = rarity   or "All"
-    mutation = mutation or "All"
+    -- rarities/mutations are tables; empty = All
+    rarities  = rarities  or {}
+    mutations = mutations or {}
+    local rarAll = (#rarities  == 0)
+    local mutAll = (#mutations == 0)
+
+    -- Build lookup sets for O(1) checks
+    local rarSet, mutSet = {}, {}
+    for _, v in ipairs(rarities)  do rarSet[v] = true end
+    for _, v in ipairs(mutations) do mutSet[v] = true end
 
     local hrp  = character:FindFirstChild("HumanoidRootPart")
     local head = character:FindFirstChild("Head")
     if not hrp then return 0 end
 
-    local safePlat   = getSafePlatform()
-    local startCFrame = hrp.CFrame -- Remember where we started
+    local startCFrame = hrp.CFrame
     local n = 0
-    local carry = math.max(1, math.min(6, carryAmount)) -- Clamp 1-6
+    local carry = math.max(1, math.min(6, carryAmount))
 
-    -- Build a flat list of all matching items first
     local matchingItems = {}
     for _, spawner in ipairs(ItemSpawners:GetChildren()) do
-        if rarity ~= "All" and spawner.Name ~= rarity then continue end
+        if not rarAll and not rarSet[spawner.Name] then continue end
         for _, item in ipairs(spawner:GetChildren()) do
             if item.Name ~= "SpawnedItem" then continue end
             local ig = item:FindFirstChild("InfoGUI")
@@ -230,10 +248,9 @@ local function pickUp(rarity, mutation)
             if not (ig and ih) then continue end
             local pr = ih:FindFirstChildOfClass("ProximityPrompt")
             if not pr then continue end
-            -- Mutation check
-            if mutation ~= "All" then
+            if not mutAll then
                 local ml = ig:FindFirstChild("TextLabels") and ig.TextLabels:FindFirstChild("Mutation")
-                if not ml or ml.Text ~= mutation then continue end
+                if not ml or not mutSet[ml.Text] then continue end
             end
             table.insert(matchingItems, {item = item, ih = ih, pr = pr})
         end
@@ -242,26 +259,16 @@ local function pickUp(rarity, mutation)
     local i = 1
     while i <= #matchingItems do
         if abortTasks then break end
-
         local batch = {}
-        -- Build a batch of up to 'carry' items
         for b = 1, carry do
             if i > #matchingItems then break end
-            table.insert(batch, matchingItems[i])
-            i += 1
+            table.insert(batch, matchingItems[i]); i += 1
         end
-
-        -- Pick up each item in the batch
         for _, entry in ipairs(batch) do
             if abortTasks then break end
-            local ih = entry.ih
-            local pr = entry.pr
-
-            -- 1. Teleport to Item
+            local ih = entry.ih; local pr = entry.pr
             hrp.CFrame = ih.CFrame + Vector3.new(0, 1, 0)
             task.wait(actionDelay)
-
-            -- 2. Fire Prompt
             if pickUpMethod == "HoldPrompt" then
                 pr:InputHoldBegin()
                 task.wait((pr.HoldDuration or 0.5) + 0.1)
@@ -269,69 +276,119 @@ local function pickUp(rarity, mutation)
             else
                 fireproximityprompt(pr)
             end
-            task.wait(0.2) -- Wait for server to attach item
+            task.wait(0.2)
         end
-
-        -- After picking up the batch, go to the safe platform (teleport down 30 studs)
         if abortTasks then break end
-
-        -- Teleport -30 studs down from current position
         hrp.CFrame = hrp.CFrame + Vector3.new(0, -30, 0)
         task.wait(0.1)
-
-        -- Wait until all carried CarryModel items are gone
         waitUntilDropped(head, 5)
-
         n += #batch
     end
 
-    -- Return Logic
     if not abortTasks then
         if pickUpReturn == "Plot Spawn" and plot and plot:FindFirstChild("Spawn") then
             hrp.CFrame = plot.Spawn.CFrame + Vector3.new(0, 3, 0)
         else
-            hrp.CFrame = startCFrame -- Last Position
+            hrp.CFrame = startCFrame
         end
     end
-
-    print("-- [PickUp] " .. n .. " items processed.")
     return n
 end
 
--- UPGRADE ALL
 local function upgradeAll(level)
     abortTasks = false
     if not plot then return end
     level = tonumber(level) or 1
-    
     for _, part in ipairs(plot:GetDescendants()) do
-        if abortTasks then break end -- Stop check
+        if abortTasks then break end
         if part.Name ~= "UpgradePart" then continue end
-        
         local slot  = part.Parent
         local floor = slot and slot.Parent and slot.Parent.Parent
         if not floor then continue end
-        
         local levels = part:FindFirstChild("UpgradeGUI")
             and part.UpgradeGUI:FindFirstChild("UpgradeButton")
             and part.UpgradeGUI.UpgradeButton:FindFirstChild("Levels")
-        
         if not levels then continue end
-
         local target = "Level " .. level .. " > Level " .. (level+1)
-        
-        -- Individual slot loop
         local t = 0
         repeat
             if abortTasks then break end
             UpgradeEvent:FireServer(floor.Name, slot.Name)
-            task.wait(actionDelay / 2) -- Faster than pickup
+            task.wait(actionDelay / 2)
             t += 1
         until levels.Text == target or t > 20
     end
 end
 
--- TELEPORT
+-- Upgrade the slot directly in front of the player using a raycast
+local function upgradeSlotInFront(level)
+    level = tonumber(level) or 1
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp then warn("[Upgrade] No HumanoidRootPart found."); return false end
+    if not plot then warn("[Upgrade] No plot found."); return false end
+
+    -- Cast a ray forward from HRP, up to 20 studs
+    local origin    = hrp.Position
+    local direction = hrp.CFrame.LookVector * 20
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {workspace}
+    rayParams.FilterType = Enum.RaycastFilterType.Include
+
+    -- Collect all BaseParts in plot as candidates
+    local plotParts = {}
+    for _, d in ipairs(plot:GetDescendants()) do
+        if d:IsA("BasePart") then table.insert(plotParts, d) end
+    end
+    rayParams.FilterDescendantsInstances = plotParts
+
+    local result = workspace:Raycast(origin, direction, rayParams)
+    if not result then
+        warn("[Upgrade] Raycast hit nothing in plot. Aim at a slot."); return false
+    end
+
+    local hitPart = result.Instance
+    -- Walk up to find the UpgradePart
+    local upgradePart = nil
+    local check = hitPart
+    for _ = 1, 5 do
+        if not check then break end
+        if check.Name == "UpgradePart" then upgradePart = check; break end
+        check = check.Parent
+    end
+
+    -- Also search siblings/descendants of the hit model for an UpgradePart
+    if not upgradePart then
+        local model = hitPart.Parent
+        if model then
+            upgradePart = model:FindFirstChild("UpgradePart", true)
+        end
+    end
+
+    if not upgradePart then
+        warn("[Upgrade] No UpgradePart found near raycast hit: " .. hitPart.Name); return false
+    end
+
+    local slot  = upgradePart.Parent
+    local floor = slot and slot.Parent and slot.Parent.Parent
+    if not floor then warn("[Upgrade] Could not find floor from UpgradePart."); return false end
+
+    local levels = upgradePart:FindFirstChild("UpgradeGUI")
+        and upgradePart.UpgradeGUI:FindFirstChild("UpgradeButton")
+        and upgradePart.UpgradeGUI.UpgradeButton:FindFirstChild("Levels")
+    if not levels then warn("[Upgrade] No Levels label found."); return false end
+
+    local target = "Level " .. level .. " > Level " .. (level+1)
+    local t = 0
+    repeat
+        UpgradeEvent:FireServer(floor.Name, slot.Name)
+        task.wait(actionDelay / 2)
+        t += 1
+    until levels.Text == target or t > 20
+
+    print("-- [Upgrade] Slot '" .. slot.Name .. "' on floor '" .. floor.Name .. "' upgraded.")
+    return true
+end
+
 local function teleportToZone(partName)
     local part = CollectionZones and CollectionZones:FindFirstChild(partName)
     if not part then warn("Zone not found: " .. partName); return end
@@ -340,75 +397,58 @@ local function teleportToZone(partName)
     hrp.CFrame = part.CFrame + Vector3.new(0, 3, 0)
 end
 
--- REBIRTH
 local function tryRebirth()
     local ls = plr:FindFirstChild("leaderstats")
     local spVal = ls and ls:FindFirstChild("Speed")
     local cur = spVal and tonumber(spVal.Value) or 0
-
     local barLabel = plr.PlayerGui:FindFirstChild("GUI")
         and plr.PlayerGui.GUI:FindFirstChild("Frames")
         and plr.PlayerGui.GUI.Frames:FindFirstChild("Rebirth")
         and plr.PlayerGui.GUI.Frames.Rebirth:FindFirstChild("Bar")
         and plr.PlayerGui.GUI.Frames.Rebirth.Bar:FindFirstChild("Text")
-
     if not barLabel then return false end
     local required = tonumber(barLabel.Text:match("/(%d+)"))
     if not required then return false end
-
-    if cur >= required then
-        RebirthEvent:FireServer()
-        return true
-    end
+    if cur >= required then RebirthEvent:FireServer(); return true end
     return false
 end
 
--- SELL
-local function doSell(sType, customMut, customRar, customLvl)
+local function doSell(sType, customMuts, customRars, customLvl)
     sType = sType or "Equipped"
-
-    -- Teleport to Sell NPC before selling
     local hrp = character:FindFirstChild("HumanoidRootPart")
     local sellMesh = workspace:FindFirstChild("Sell") and workspace.Sell:FindFirstChild("Mesh")
     if hrp and sellMesh then
         hrp.CFrame = CFrame.new(sellMesh.Position + Vector3.new(0, 3, 0))
-        task.wait(0.1)
+        task.wait(sellTeleportDelay)
     end
-
     if sType == "Custom" then
-        -- Move all tools from character to backpack first
+        local mutAll = (#customMuts == 0)
+        local rarAll = (#customRars == 0)
+        local mutSet, rarSet = {}, {}
+        for _, v in ipairs(customMuts) do mutSet[v] = true end
+        for _, v in ipairs(customRars) do rarSet[v] = true end
         local charTools = {}
         for _, obj in ipairs(character:GetChildren()) do
-            if obj:IsA("Tool") then
-                table.insert(charTools, obj)
-            end
+            if obj:IsA("Tool") then table.insert(charTools, obj) end
         end
-        for _, tool in ipairs(charTools) do
-            tool.Parent = plr.Backpack
-        end
-
-        -- Check backpack for matching tools by attributes
-        local matchedTool = nil
+        for _, tool in ipairs(charTools) do tool.Parent = plr.Backpack end
+        local sold = false
         for _, tool in ipairs(plr.Backpack:GetChildren()) do
             if not tool:IsA("Tool") then continue end
             local mutAttr = tool:GetAttribute("Mutation")
             local rarAttr = tool:GetAttribute("Rarity")
             local lvlAttr = tool:GetAttribute("Level")
-
-            local mutMatch = (customMut == "All" or mutAttr == customMut)
-            local rarMatch = (customRar == "All" or rarAttr == customRar)
+            local mutMatch = mutAll or mutSet[mutAttr]
+            local rarMatch = rarAll or rarSet[rarAttr]
             local lvlMatch = (customLvl == "" or tostring(lvlAttr) == tostring(customLvl))
-
             if mutMatch and rarMatch and lvlMatch then
-                matchedTool = tool
-                break
+                tool.Parent = character
+                SellEvent:FireServer("Equipped")
+                task.wait(0.1)
+                sold = true
             end
         end
-
-        if matchedTool then
-            matchedTool.Parent = character
-            SellEvent:FireServer("Equipped")
-        else
+        if not sold then
             warn("[PongHub] No matching tool found in backpack for Custom sell.")
         end
     else
@@ -416,7 +456,6 @@ local function doSell(sType, customMut, customRar, customLvl)
     end
 end
 
--- BUY SPEED
 local function buySpeed()
     local gui = plr.PlayerGui:FindFirstChild("GUI")
     if not gui then return end
@@ -426,34 +465,23 @@ local function buySpeed()
     if not speedFrame then return end
     local scrolling = speedFrame:FindFirstChild("Scrolling")
     if not scrolling then return end
-
     local ls = plr:FindFirstChild("leaderstats")
     local moneyVal = ls and ls:FindFirstChild("Money")
     local currentMoney = moneyVal and abbreviate(tostring(moneyVal.Value), true) or 0
-
     local bestValue = -math.huge
     local bestOption = nil
-
     for _, desc in ipairs(scrolling:GetDescendants()) do
         if desc:IsA("TextLabel") and desc.Parent and desc.Parent.Name == "Money" then
             local itemCost = abbreviate(desc.Text, true)
             if itemCost <= currentMoney and itemCost > bestValue then
                 bestValue = itemCost
-                bestOption = desc.Parent.Parent.Parent -- TextLabel -> Money -> ... -> Option_N
+                bestOption = desc.Parent.Parent.Parent
             end
         end
     end
-
     if bestOption then
         local optionNum = tonumber(bestOption.Name:match("_(%d+)"))
-        if optionNum then
-            SpeedEvent:FireServer(optionNum)
-            print("-- [Speed] Purchased speed option: " .. optionNum)
-        else
-            warn("[PongHub] Could not parse option number from: " .. bestOption.Name)
-        end
-    else
-        warn("[PongHub] No affordable speed upgrade found.")
+        if optionNum then SpeedEvent:FireServer(optionNum) end
     end
 end
 
@@ -472,24 +500,18 @@ local function stopAutoCollect()
     if autoCollectThread then task.cancel(autoCollectThread); autoCollectThread = nil end
 end
 
--- Wave destroy connections (event-driven — fires the instant a wave is added)
 local waveConns = {}
 local function startAutoDestroy()
-    -- Disconnect any old connections first
     for _, c in ipairs(waveConns) do c:Disconnect() end
     waveConns = {}
-
     local function onChildAdded(child)
         if not autoDestroyEnabled then return end
         if child.Name == "Start" or child.Name == "End" then return end
-        -- Destroy as fast as possible on the next heartbeat to avoid race conditions
         task.defer(function()
             if child and child.Parent then child:Destroy() end
         end)
     end
-
     if tsunamisFolder then
-        -- Destroy any already-existing waves immediately
         for _, v in ipairs(tsunamisFolder:GetChildren()) do
             if v.Name ~= "Start" and v.Name ~= "End" then v:Destroy() end
         end
@@ -512,7 +534,7 @@ local function startAutoPickUp()
     if autoPickUpThread then task.cancel(autoPickUpThread) end
     autoPickUpThread = task.spawn(function()
         while autoPickUpEnabled and not scriptDestroyed do
-            pickUp(autoPickUpRarity, autoPickUpMutation); task.wait(1)
+            pickUp(autoPickUpRarities, autoPickUpMutations); task.wait(1)
         end
     end)
 end
@@ -538,7 +560,7 @@ local function startAutoSell()
     if autoSellThread then task.cancel(autoSellThread) end
     autoSellThread = task.spawn(function()
         while autoSellEnabled and not scriptDestroyed do
-            doSell(sellType, sellCustomMutation, sellCustomRarity, sellCustomLevel)
+            doSell(sellType, sellCustomMutations, sellCustomRarities, sellCustomLevel)
             task.wait(1)
         end
     end)
@@ -572,116 +594,66 @@ local function stopAutoVip()
     if autoVipThread then task.cancel(autoVipThread); autoVipThread = nil end
 end
 
--- BOSS KILL
 local function killBoss()
-    -- Track the current character reference locally so we survive respawns
     local function getHRP()
         return character and character:FindFirstChild("HumanoidRootPart")
     end
-    local function getHead()
-        return character and character:FindFirstChild("Head")
-    end
-
-    -- Save a return position at the start (updated on each new boss fight)
     local preFightCFrame = nil
-
-    -- Tilt -90 degrees around X axis (face tilted downward toward boss)
     local tiltCF = CFrame.Angles(math.rad(-90), 0, 0)
-
-    -- Handle respawn: reconnect character and re-equip bat
     local respawnConn
     respawnConn = plr.CharacterAdded:Connect(function(newChar)
         character = newChar
-        -- Wait for HRP to be ready
         newChar:WaitForChild("HumanoidRootPart", 10)
-        task.wait(0.2) -- brief settle after spawn
-
-        -- Re-equip bat
+        task.wait(0.2)
         task.spawn(function()
             local bat = character:FindFirstChild("Bat")
             if not bat then
                 local batInBag = plr.Backpack:FindFirstChild("Bat")
-                if batInBag then
-                    batInBag.Parent = character
-                end
+                if batInBag then batInBag.Parent = character end
             end
         end)
     end)
 
     while autoBossEnabled and not scriptDestroyed do
         local boss = workspace:FindFirstChild("WorldBoss")
-
-        if not boss then
-            -- No boss present — wait for one to appear
-            task.wait(1)
-            continue
-        end
-
+        if not boss then task.wait(1); continue end
         local bossHead = boss:FindFirstChild("Head")
         if not bossHead then task.wait(0.5); continue end
-
-        -- Save position before fight (only if we have a valid HRP)
         local hrp = getHRP()
-        if hrp then
-            preFightCFrame = hrp.CFrame
-        end
-
-        -- Equip Bat tool if not already in character
+        if hrp then preFightCFrame = hrp.CFrame end
         local batInChar = character and character:FindFirstChild("Bat")
         if not batInChar then
             local batInBag = plr.Backpack:FindFirstChild("Bat")
-            if batInBag then
-                batInBag.Parent = character
-                task.wait(0.1)
-            end
+            if batInBag then batInBag.Parent = character; task.wait(0.1) end
         end
         local bat = character and character:FindFirstChild("Bat")
-
-        -- Stay above boss head and swing until dead
         while autoBossEnabled and not scriptDestroyed do
             boss = workspace:FindFirstChild("WorldBoss")
-            if not boss then break end -- Boss died/removed
-
+            if not boss then break end
             bossHead = boss:FindFirstChild("Head")
             if not bossHead then break end
-
             hrp = getHRP()
             if hrp then
-                -- Stay at configured distance above boss head, tilted -90° (facing down)
                 local targetPos = bossHead.Position + Vector3.new(0, bossDistance, 0)
                 hrp.CFrame = CFrame.new(targetPos) * tiltCF
             else
-                -- Dead / respawning — just wait for character to come back
-                task.wait(0.1)
-                continue
+                task.wait(0.1); continue
             end
-
-            -- Activate bat
             bat = character and character:FindFirstChild("Bat")
             if bat and bat.Parent == character then
                 bat:Activate()
             elseif character then
-                -- Re-find bat in case it got unequipped
                 if not bat then
                     local batInBag = plr.Backpack:FindFirstChild("Bat")
                     if batInBag then batInBag.Parent = character; bat = character:FindFirstChild("Bat") end
                 end
             end
-
-            task.wait() -- Minimum delay (next frame)
+            task.wait()
         end
-
-        -- Boss gone — return to pre-fight position
         hrp = getHRP()
-        if hrp and preFightCFrame then
-            hrp.CFrame = preFightCFrame
-        end
-
-        print("-- [Boss] WorldBoss defeated or gone. Waiting for next spawn.")
-        task.wait(1) -- Brief pause before checking again
+        if hrp and preFightCFrame then hrp.CFrame = preFightCFrame end
+        task.wait(1)
     end
-
-    -- Clean up respawn listener when boss auto is stopped
     if respawnConn then respawnConn:Disconnect() end
 end
 
@@ -692,6 +664,233 @@ end
 local function stopAutoBoss()
     autoBossEnabled = false
     if autoBossThread then task.cancel(autoBossThread); autoBossThread = nil end
+end
+
+-- ============================================================
+--  VISUALS STATE
+-- ============================================================
+
+local fpsBoostEnabled     = false
+local playerEspEnabled    = false
+local itemEspEnabled      = false
+local bossEspEnabled      = false
+local itemEspRarities     = {}   -- {} = All
+local itemEspMutations    = {}   -- {} = All
+
+-- Highlight storage  { [instance] = Highlight }
+local playerEspHighlights = {}
+local itemEspHighlights   = {}
+local bossEspHighlight    = nil
+local itemEspThread       = nil
+
+-- ── FPS BOOST ───────────────────────────────────────────────
+local _origLighting = {}
+local function applyFpsBoost()
+    local L = game:GetService("Lighting")
+    _origLighting = {
+        Brightness        = L.Brightness,
+        ClockTime         = L.ClockTime,
+        FogEnd            = L.FogEnd,
+        FogStart          = L.FogStart,
+        GlobalShadows     = L.GlobalShadows,
+        Ambient           = L.Ambient,
+        OutdoorAmbient    = L.OutdoorAmbient,
+    }
+    L.Brightness     = 0
+    L.GlobalShadows  = false
+    L.FogEnd         = 100000
+    L.FogStart       = 100000
+    L.Ambient        = Color3.fromRGB(178, 178, 178)
+    L.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
+    -- Remove all post-processing effects
+    for _, e in ipairs(L:GetChildren()) do
+        if e:IsA("PostEffect") or e:IsA("Sky") or e:IsA("Atmosphere") then
+            e.Enabled = pcall(function() e.Enabled = false end) and false or e.Enabled
+            pcall(function() e.Enabled = false end)
+        end
+    end
+    -- Lower workspace quality
+    workspace.StreamingEnabled = false
+    pcall(function()
+        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+    end)
+end
+
+local function removeFpsBoost()
+    local L = game:GetService("Lighting")
+    for k, v in pairs(_origLighting) do
+        pcall(function() L[k] = v end)
+    end
+    for _, e in ipairs(L:GetChildren()) do
+        if e:IsA("PostEffect") or e:IsA("Sky") or e:IsA("Atmosphere") then
+            pcall(function() e.Enabled = true end)
+        end
+    end
+end
+
+-- ── PLAYER ESP ──────────────────────────────────────────────
+local function addPlayerEsp(p)
+    if p == plr then return end
+    if playerEspHighlights[p] then return end
+    local function attachHL(char)
+        if playerEspHighlights[p] and playerEspHighlights[p].Parent then
+            playerEspHighlights[p]:Destroy()
+        end
+        local hl = Instance.new("Highlight")
+        hl.FillColor        = Color3.fromRGB(255, 80, 80)
+        hl.OutlineColor     = Color3.fromRGB(255, 255, 255)
+        hl.FillTransparency = 0.5
+        hl.DepthMode        = Enum.HighlightDepthMode.AlwaysOnTop
+        hl.Adornee          = char
+        hl.Parent           = char
+        playerEspHighlights[p] = hl
+    end
+    if p.Character then attachHL(p.Character) end
+    local conn = p.CharacterAdded:Connect(function(c)
+        task.wait(0.1); attachHL(c)
+    end)
+    -- stash conn on the highlight table so we can clean up
+    playerEspHighlights["_conn_" .. p.UserId] = conn
+end
+
+local function removePlayerEsp(p)
+    local hl = playerEspHighlights[p]
+    if hl and hl.Parent then hl:Destroy() end
+    playerEspHighlights[p] = nil
+    local conn = playerEspHighlights["_conn_" .. p.UserId]
+    if conn then conn:Disconnect() end
+    playerEspHighlights["_conn_" .. p.UserId] = nil
+end
+
+local function enablePlayerEsp()
+    for _, p in ipairs(Players:GetPlayers()) do addPlayerEsp(p) end
+end
+local function disablePlayerEsp()
+    for p, _ in pairs(playerEspHighlights) do
+        if typeof(p) == "Instance" then removePlayerEsp(p) end
+    end
+    playerEspHighlights = {}
+end
+
+Players.PlayerAdded:Connect(function(p)
+    if playerEspEnabled then addPlayerEsp(p) end
+end)
+Players.PlayerRemoving:Connect(function(p)
+    removePlayerEsp(p)
+end)
+
+-- ── ITEM ESP ────────────────────────────────────────────────
+local function itemMatchesFilter(item)
+    if not ItemSpawners then return false end
+    local rarAll = (#itemEspRarities == 0)
+    local mutAll = (#itemEspMutations == 0)
+    local rarSet, mutSet = {}, {}
+    for _, v in ipairs(itemEspRarities)  do rarSet[v] = true end
+    for _, v in ipairs(itemEspMutations) do mutSet[v] = true end
+
+    if not rarAll and not rarSet[item.Parent and item.Parent.Name] then return false end
+    local ig = item:FindFirstChild("InfoGUI")
+    if not mutAll then
+        local ml = ig and ig:FindFirstChild("TextLabels") and ig.TextLabels:FindFirstChild("Mutation")
+        if not ml or not mutSet[ml.Text] then return false end
+    end
+    return true
+end
+
+local function clearItemEsp()
+    for item, hl in pairs(itemEspHighlights) do
+        if hl and hl.Parent then hl:Destroy() end
+    end
+    itemEspHighlights = {}
+end
+
+local function refreshItemEsp()
+    clearItemEsp()
+    if not ItemSpawners then return end
+    for _, spawner in ipairs(ItemSpawners:GetChildren()) do
+        for _, item in ipairs(spawner:GetChildren()) do
+            if item.Name ~= "SpawnedItem" then continue end
+            if not itemMatchesFilter(item) then continue end
+            local root = item:FindFirstChild("HumanoidRootPart") or item:FindFirstChildOfClass("BasePart")
+            if not root then continue end
+            local hl = Instance.new("Highlight")
+            hl.FillColor        = Color3.fromRGB(80, 200, 255)
+            hl.OutlineColor     = Color3.fromRGB(255, 255, 255)
+            hl.FillTransparency = 0.4
+            hl.DepthMode        = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Adornee          = item
+            hl.Parent           = item
+            itemEspHighlights[item] = hl
+        end
+    end
+end
+
+local function startItemEsp()
+    if itemEspThread then task.cancel(itemEspThread) end
+    itemEspThread = task.spawn(function()
+        while itemEspEnabled and not scriptDestroyed do
+            refreshItemEsp()
+            task.wait(2)
+        end
+    end)
+end
+
+local function stopItemEsp()
+    itemEspEnabled = false
+    if itemEspThread then task.cancel(itemEspThread); itemEspThread = nil end
+    clearItemEsp()
+end
+
+-- ── BOSS ESP ────────────────────────────────────────────────
+local function refreshBossEsp()
+    local boss = workspace:FindFirstChild("WorldBoss")
+    if boss then
+        if not bossEspHighlight or not bossEspHighlight.Parent then
+            local hl = Instance.new("Highlight")
+            hl.FillColor        = Color3.fromRGB(255, 60, 60)
+            hl.OutlineColor     = Color3.fromRGB(255, 200, 0)
+            hl.FillTransparency = 0.3
+            hl.DepthMode        = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Adornee          = boss
+            hl.Parent           = boss
+            bossEspHighlight    = hl
+        end
+    else
+        if bossEspHighlight and bossEspHighlight.Parent then
+            bossEspHighlight:Destroy()
+        end
+        bossEspHighlight = nil
+    end
+end
+
+local bossEspConn = nil
+local function enableBossEsp()
+    refreshBossEsp()
+    bossEspConn = RunService.Heartbeat:Connect(function()
+        if not bossEspEnabled then return end
+        refreshBossEsp()
+    end)
+end
+local function disableBossEsp()
+    if bossEspConn then bossEspConn:Disconnect(); bossEspConn = nil end
+    if bossEspHighlight and bossEspHighlight.Parent then bossEspHighlight:Destroy() end
+    bossEspHighlight = nil
+end
+
+-- ── STAT SETTERS ─────────────────────────────────────────────
+local function setLeaderstat(name, value)
+    local ls = plr:FindFirstChild("leaderstats")
+    if ls and ls:FindFirstChild(name) then
+        ls[name].Value = value
+    end
+end
+
+local function setHudLabel(name, text)
+    local gui = plr.PlayerGui:FindFirstChild("GUI")
+    local lbl = gui and gui:FindFirstChild("HUD") and
+                gui.HUD:FindFirstChild("Labels") and
+                gui.HUD.Labels:FindFirstChild(name)
+    if lbl then lbl.Text = text end
 end
 
 -- ============================================================
@@ -725,6 +924,7 @@ local C = {
     SPEED   = Color3.fromRGB(80, 200, 180),
     VIP     = Color3.fromRGB(255, 195, 0),
     BOSS    = Color3.fromRGB(220, 60, 60),
+    ALERT   = Color3.fromRGB(255, 80, 80),
 }
 
 -- ============================================================
@@ -760,8 +960,6 @@ local function tw(obj, props, dur)
         props):Play()
 end
 
--- Registry of currently-open dropdowns so they track the window while dragging
--- Each entry: { listFrame, getAnchorRow } where getAnchorRow returns the row Frame
 local openDropdowns = {}
 RunService.RenderStepped:Connect(function()
     for _, entry in ipairs(openDropdowns) do
@@ -804,7 +1002,7 @@ local anchor = Instance.new("Frame")
 anchor.Name        = "PongHubAnchor"
 anchor.AnchorPoint = Vector2.new(0.5, 0.5)
 anchor.Position    = UDim2.new(0.5, 0, 0.5, 0)
-anchor.Size        = UDim2.new(0.48, 0, 0.65, 0) -- Slightly taller
+anchor.Size        = UDim2.new(0.48, 0, 0.65, 0)
 anchor.BackgroundTransparency = 1
 anchor.Active      = false
 anchor.Parent      = screenGui
@@ -821,7 +1019,6 @@ win.Active           = false
 win.Parent           = anchor
 corner(win, 12); stroke(win, C.BORDER, 1.5)
 
--- Title Bar
 local titleBar = Instance.new("Frame")
 titleBar.Size = UDim2.new(1, 0, 0, 40); titleBar.BackgroundColor3 = C.HEADER
 titleBar.BorderSizePixel = 0; titleBar.Active = true; titleBar.ZIndex = 5; titleBar.Parent = win
@@ -837,7 +1034,7 @@ titleLbl.Active = false; titleLbl.ZIndex = 6; titleLbl.Parent = titleBar
 local closeBtn = Instance.new("TextButton")
 closeBtn.Size = UDim2.new(0,28,0,28); closeBtn.AnchorPoint = Vector2.new(1,0.5)
 closeBtn.Position = UDim2.new(1,-7,0.5,0); closeBtn.BackgroundColor3 = C.DANGER
-closeBtn.Text = "✕"; closeBtn.TextColor3 = Color3.new(1,1,1)
+closeBtn.Text = "x"; closeBtn.TextColor3 = Color3.new(1,1,1)
 closeBtn.Font = Enum.Font.GothamBold; closeBtn.TextSize = 13
 closeBtn.AutoButtonColor = false; closeBtn.BorderSizePixel = 0
 closeBtn.Active = true; closeBtn.ZIndex = 7; closeBtn.Parent = titleBar
@@ -846,7 +1043,6 @@ closeBtn.MouseButton1Click:Connect(function() anchor.Visible = false end)
 
 makeDraggable(anchor, titleBar)
 
--- Scroll
 local scroll = Instance.new("ScrollingFrame")
 scroll.Size = UDim2.new(1, 0, 1, -40); scroll.Position = UDim2.new(0, 0, 0, 40)
 scroll.BackgroundTransparency = 1; scroll.BorderSizePixel = 0
@@ -859,6 +1055,607 @@ local dropOverlay = Instance.new("Frame")
 dropOverlay.Name = "DropOverlay"; dropOverlay.Size = UDim2.new(1,0,1,0)
 dropOverlay.BackgroundTransparency = 1; dropOverlay.Active = false
 dropOverlay.ZIndex = 100; dropOverlay.Parent = screenGui
+
+-- ============================================================
+--  NOTIFICATION SYSTEM
+-- ============================================================
+
+local notifContainer = Instance.new("Frame")
+notifContainer.Name = "NotifContainer"
+notifContainer.AnchorPoint = Vector2.new(1, 0)
+notifContainer.Position = UDim2.new(1, -16, 0, 60)
+notifContainer.Size = UDim2.new(0, 320, 1, -80)
+notifContainer.BackgroundTransparency = 1
+notifContainer.Parent = screenGui
+
+local notifList = Instance.new("UIListLayout")
+notifList.FillDirection = Enum.FillDirection.Vertical
+notifList.VerticalAlignment = Enum.VerticalAlignment.Top
+notifList.HorizontalAlignment = Enum.HorizontalAlignment.Right
+notifList.Padding = UDim.new(0, 8)
+notifList.SortOrder = Enum.SortOrder.LayoutOrder
+notifList.Parent = notifContainer
+
+local function showNotification(title, body, onTeleport, intruderPlayer)
+    local notif = Instance.new("Frame")
+    notif.Size = UDim2.new(1, 0, 0, onTeleport and 110 or 78)
+    notif.BackgroundColor3 = Color3.fromRGB(18, 18, 28)
+    notif.BorderSizePixel = 0
+    notif.Position = UDim2.new(1.2, 0, 0, 0)
+    notif.Parent = notifContainer
+    corner(notif, 10)
+    stroke(notif, C.ALERT, 1.5)
+
+    local accent = Instance.new("Frame")
+    accent.Size = UDim2.new(0, 4, 1, 0)
+    accent.BackgroundColor3 = C.ALERT
+    accent.BorderSizePixel = 0
+    accent.Parent = notif
+    corner(accent, 4)
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -50, 0, 22)
+    titleLabel.Position = UDim2.new(0, 14, 0, 10)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = title
+    titleLabel.TextColor3 = C.ALERT
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 13
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = notif
+
+    local bodyLabel = Instance.new("TextLabel")
+    bodyLabel.Size = UDim2.new(1, -20, 0, 26)
+    bodyLabel.Position = UDim2.new(0, 14, 0, 32)
+    bodyLabel.BackgroundTransparency = 1
+    bodyLabel.Text = body
+    bodyLabel.TextColor3 = C.TEXT
+    bodyLabel.Font = Enum.Font.Gotham
+    bodyLabel.TextSize = 12
+    bodyLabel.TextWrapped = true
+    bodyLabel.TextXAlignment = Enum.TextXAlignment.Left
+    bodyLabel.Parent = notif
+
+    local closeX = Instance.new("TextButton")
+    closeX.Size = UDim2.new(0, 22, 0, 22)
+    closeX.AnchorPoint = Vector2.new(1, 0)
+    closeX.Position = UDim2.new(1, -8, 0, 8)
+    closeX.BackgroundColor3 = C.DANGER
+    closeX.Text = "x"
+    closeX.TextColor3 = Color3.new(1,1,1)
+    closeX.Font = Enum.Font.GothamBold
+    closeX.TextSize = 11
+    closeX.BorderSizePixel = 0
+    closeX.AutoButtonColor = false
+    closeX.Parent = notif
+    corner(closeX, 5)
+
+    if onTeleport then
+        local tpBtn = Instance.new("TextButton")
+        tpBtn.Size = UDim2.new(1, -20, 0, 28)
+        tpBtn.Position = UDim2.new(0, 10, 0, 74)
+        tpBtn.BackgroundColor3 = C.ACCENT
+        tpBtn.Text = "⚡ Teleport to Intruder"
+        tpBtn.TextColor3 = Color3.new(1,1,1)
+        tpBtn.Font = Enum.Font.GothamBold
+        tpBtn.TextSize = 12
+        tpBtn.BorderSizePixel = 0
+        tpBtn.AutoButtonColor = false
+        tpBtn.Parent = notif
+        corner(tpBtn, 7)
+        tpBtn.MouseButton1Click:Connect(function()
+            onTeleport()
+            notif:Destroy()
+        end)
+    end
+
+    closeX.MouseButton1Click:Connect(function()
+        tw(notif, {Position = UDim2.new(1.2, 0, 0, 0)}, 0.2)
+        task.delay(0.25, function() notif:Destroy() end)
+    end)
+
+    -- Slide in
+    tw(notif, {Position = UDim2.new(0, 0, 0, 0)}, 0.3)
+
+    -- Auto dismiss after 8 seconds
+    task.delay(8, function()
+        if notif and notif.Parent then
+            tw(notif, {Position = UDim2.new(1.2, 0, 0, 0)}, 0.3)
+            task.delay(0.35, function()
+                if notif and notif.Parent then notif:Destroy() end
+            end)
+        end
+    end)
+
+    return notif
+end
+
+-- ============================================================
+--  INTRUDER ALERT SYSTEM
+-- ============================================================
+
+-- Creates an ESP Highlight for a player
+local function createHighlight(targetChar)
+    local hl = Instance.new("SelectionBox")
+    hl.Color3 = Color3.fromRGB(255, 50, 50)
+    hl.LineThickness = 0.06
+    hl.SurfaceTransparency = 0.7
+    hl.SurfaceColor3 = Color3.fromRGB(255, 50, 50)
+    hl.Adornee = targetChar
+    hl.Parent = workspace
+    return hl
+end
+
+-- Creates a BillboardGui above the intruder's head with a teleport button
+local function createBillboard(targetChar, intruderPlr)
+    local humanoidRootPart = targetChar:FindFirstChild("HumanoidRootPart") or targetChar:FindFirstChild("Head")
+    if not humanoidRootPart then return nil end
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "IntruderBillboard"
+    bb.Size = UDim2.new(0, 180, 0, 60)
+    bb.StudsOffset = Vector3.new(0, 3, 0)
+    bb.AlwaysOnTop = true
+    bb.Adornee = humanoidRootPart
+    bb.Parent = screenGui
+
+    local bg = Instance.new("Frame")
+    bg.Size = UDim2.new(1, 0, 1, 0)
+    bg.BackgroundColor3 = Color3.fromRGB(18, 18, 28)
+    bg.BorderSizePixel = 0
+    bg.Parent = bb
+    corner(bg, 8)
+    stroke(bg, C.ALERT, 1.5)
+
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.Size = UDim2.new(1, -10, 0, 20)
+    nameLbl.Position = UDim2.new(0, 5, 0, 4)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Text = "⚠ INTRUDER: " .. intruderPlr.Name
+    nameLbl.TextColor3 = C.ALERT
+    nameLbl.Font = Enum.Font.GothamBold
+    nameLbl.TextSize = 11
+    nameLbl.TextScaled = false
+    nameLbl.Parent = bg
+
+    local tpBtn = Instance.new("TextButton")
+    tpBtn.Size = UDim2.new(1, -10, 0, 26)
+    tpBtn.Position = UDim2.new(0, 5, 0, 28)
+    tpBtn.BackgroundColor3 = C.ACCENT
+    tpBtn.Text = "⚡ Teleport"
+    tpBtn.TextColor3 = Color3.new(1,1,1)
+    tpBtn.Font = Enum.Font.GothamBold
+    tpBtn.TextSize = 12
+    tpBtn.BorderSizePixel = 0
+    tpBtn.AutoButtonColor = false
+    tpBtn.Parent = bg
+    corner(tpBtn, 6)
+
+    tpBtn.MouseButton1Click:Connect(function()
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        local targetHrp = targetChar and (targetChar:FindFirstChild("HumanoidRootPart") or targetChar:FindFirstChild("Head"))
+        if hrp and targetHrp then
+            hrp.CFrame = CFrame.new(targetHrp.Position + Vector3.new(0, 3, 0))
+        end
+        bb:Destroy()
+    end)
+
+    return bb
+end
+
+-- Remove all intruder data for a player
+local function clearIntruder(p)
+    local data = intruderData[p]
+    if data then
+        if data.highlight and data.highlight.Parent then data.highlight:Destroy() end
+        if data.billboard and data.billboard.Parent then data.billboard:Destroy() end
+        if data.timerThread then task.cancel(data.timerThread) end
+        intruderData[p] = nil
+    end
+end
+
+-- Trigger the full alert for an intruder
+local function triggerAlert(intruderPlr)
+    if not intruderAlertEnabled then return end
+    local data = intruderData[intruderPlr]
+    if not data or data.alerted then return end
+    data.alerted = true
+
+    local targetChar = intruderPlr.Character
+    if not targetChar then return end
+
+    -- Create ESP Highlight
+    data.highlight = createHighlight(targetChar)
+
+    -- Create Billboard
+    data.billboard = createBillboard(targetChar, intruderPlr)
+
+    -- Send notification
+    local function doTeleport()
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        local targetHrp = targetChar and (targetChar:FindFirstChild("HumanoidRootPart") or targetChar:FindFirstChild("Head"))
+        if hrp and targetHrp then
+            hrp.CFrame = CFrame.new(targetHrp.Position + Vector3.new(0, 3, 0))
+        end
+        -- Remove billboard after teleport
+        if data.billboard and data.billboard.Parent then
+            data.billboard:Destroy()
+            data.billboard = nil
+        end
+    end
+
+    showNotification(
+        "⚠ PLOT INTRUDER DETECTED!",
+        intruderPlr.Name .. " has been on your plot for 5+ seconds!",
+        doTeleport,
+        intruderPlr
+    )
+
+    print("-- [IntruderAlert] " .. intruderPlr.Name .. " detected on your plot!")
+end
+
+-- Billboard proximity check (hide billboard when player is within 20 studs)
+RunService.Heartbeat:Connect(function()
+    local myHrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not myHrp then return end
+
+    for p, data in pairs(intruderData) do
+        if not data.alerted then continue end
+        local targetChar = p.Character
+        if not targetChar then continue end
+        local targetHrp = targetChar:FindFirstChild("HumanoidRootPart")
+        if not targetHrp then continue end
+
+        local dist = (myHrp.Position - targetHrp.Position).Magnitude
+
+        -- Hide billboard when close, show when far
+        if data.billboard and data.billboard.Parent then
+            data.billboard.Enabled = dist > INTRUDER_CLOSE_DIST
+        end
+    end
+end)
+
+-- Check if a BasePart belongs to the player's plot
+local function isPlotPart(part)
+    if not plot then return false end
+    return part:IsDescendantOf(plot)
+end
+
+-- Player touch tracking
+local playerTouchTime = {} -- { [player] = tick() when they first touched }
+local playerOnPlot    = {} -- { [player] = bool }
+
+local function onPartTouched(hit)
+    if not intruderAlertEnabled then return end
+    if not plot then return end
+
+    local touchingChar = hit.Parent
+    if not touchingChar then return end
+    local touchingPlr = Players:GetPlayerFromCharacter(touchingChar)
+    if not touchingPlr then return end
+    if touchingPlr == plr then return end -- Ignore self
+
+    -- Already on plot
+    if playerOnPlot[touchingPlr] then return end
+    playerOnPlot[touchingPlr] = true
+    playerTouchTime[touchingPlr] = tick()
+
+    -- Start a timer thread for this player
+    local timerThread = task.spawn(function()
+        task.wait(INTRUDER_LINGER_TIME)
+
+        -- After 5 seconds, check if they're still on the plot
+        if playerOnPlot[touchingPlr] then
+            -- Initialize intruder data if needed
+            if not intruderData[touchingPlr] then
+                intruderData[touchingPlr] = {
+                    alerted = false,
+                    highlight = nil,
+                    billboard = nil,
+                    timerThread = nil
+                }
+            end
+            triggerAlert(touchingPlr)
+        end
+    end)
+
+    if intruderData[touchingPlr] then
+        intruderData[touchingPlr].timerThread = timerThread
+    else
+        intruderData[touchingPlr] = {
+            alerted = false,
+            highlight = nil,
+            billboard = nil,
+            timerThread = timerThread
+        }
+    end
+end
+
+local function onPartTouchEnded(hit)
+    local touchingChar = hit and hit.Parent
+    if not touchingChar then return end
+    local touchingPlr = Players:GetPlayerFromCharacter(touchingChar)
+    if not touchingPlr or touchingPlr == plr then return end
+
+    -- Small delay to handle part-to-part transitions within the plot
+    task.delay(0.5, function()
+        -- Re-check: are they touching any plot part?
+        if not plot then
+            playerOnPlot[touchingPlr] = nil
+            playerTouchTime[touchingPlr] = nil
+            if not (intruderData[touchingPlr] and intruderData[touchingPlr].alerted) then
+                clearIntruder(touchingPlr)
+            end
+            return
+        end
+
+        local stillOn = false
+        local tChar = touchingPlr.Character
+        if tChar then
+            for _, part in ipairs(plot:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    local partPos = part.Position
+                    local partSize = part.Size
+                    -- Simple bounding box check
+                    for _, limb in ipairs(tChar:GetDescendants()) do
+                        if limb:IsA("BasePart") then
+                            local dist = (limb.Position - partPos)
+                            if math.abs(dist.X) < partSize.X/2 + 1 and
+                               math.abs(dist.Y) < partSize.Y/2 + 2 and
+                               math.abs(dist.Z) < partSize.Z/2 + 1 then
+                                stillOn = true
+                                break
+                            end
+                        end
+                    end
+                    if stillOn then break end
+                end
+            end
+        end
+
+        if not stillOn then
+            playerOnPlot[touchingPlr] = nil
+            playerTouchTime[touchingPlr] = nil
+            -- If they weren't alerted yet, cancel their timer
+            if intruderData[touchingPlr] and not intruderData[touchingPlr].alerted then
+                if intruderData[touchingPlr].timerThread then
+                    task.cancel(intruderData[touchingPlr].timerThread)
+                end
+                intruderData[touchingPlr] = nil
+            end
+        end
+    end)
+end
+
+-- Connect touch events to all plot parts
+local function connectPlotTouches()
+    -- Clear old connections
+    for _, conn in ipairs(intruderConnections) do conn:Disconnect() end
+    intruderConnections = {}
+
+    if not plot then return end
+
+    for _, part in ipairs(plot:GetDescendants()) do
+        if part:IsA("BasePart") then
+            table.insert(intruderConnections, part.Touched:Connect(onPartTouched))
+            table.insert(intruderConnections, part.TouchEnded:Connect(onPartTouchEnded))
+        end
+    end
+
+    -- Also watch for new parts being added
+    table.insert(intruderConnections, plot.DescendantAdded:Connect(function(desc)
+        if desc:IsA("BasePart") then
+            table.insert(intruderConnections, desc.Touched:Connect(onPartTouched))
+            table.insert(intruderConnections, desc.TouchEnded:Connect(onPartTouchEnded))
+        end
+    end))
+end
+
+-- Clean up when a player leaves
+Players.PlayerRemoving:Connect(function(p)
+    clearIntruder(p)
+    playerOnPlot[p] = nil
+    playerTouchTime[p] = nil
+end)
+
+-- Clean up when intruder's character resets
+Players.PlayerAdded:Connect(function(p)
+    p.CharacterAdded:Connect(function()
+        -- When intruder respawns, remove old highlight/billboard
+        task.wait(0.1)
+        if intruderData[p] then
+            if intruderData[p].highlight and intruderData[p].highlight.Parent then
+                intruderData[p].highlight:Destroy()
+                intruderData[p].highlight = nil
+            end
+            if intruderData[p].billboard and intruderData[p].billboard.Parent then
+                intruderData[p].billboard:Destroy()
+                intruderData[p].billboard = nil
+            end
+            -- Reapply highlight on new character
+            if intruderData[p].alerted then
+                local newChar = p.Character
+                if newChar then
+                    intruderData[p].highlight = createHighlight(newChar)
+                    intruderData[p].billboard = createBillboard(newChar, p)
+                end
+            end
+        end
+        playerOnPlot[p] = nil
+    end)
+end)
+
+-- Also handle existing players
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= plr then
+        p.CharacterAdded:Connect(function()
+            task.wait(0.1)
+            if intruderData[p] then
+                if intruderData[p].highlight and intruderData[p].highlight.Parent then
+                    intruderData[p].highlight:Destroy(); intruderData[p].highlight = nil
+                end
+                if intruderData[p].billboard and intruderData[p].billboard.Parent then
+                    intruderData[p].billboard:Destroy(); intruderData[p].billboard = nil
+                end
+                if intruderData[p].alerted then
+                    local newChar = p.Character
+                    if newChar then
+                        intruderData[p].highlight = createHighlight(newChar)
+                        intruderData[p].billboard = createBillboard(newChar, p)
+                    end
+                end
+            end
+            playerOnPlot[p] = nil
+        end)
+    end
+end
+
+-- AUTO KILL INTRUDER
+local function startAutoKillIntruder()
+    if autoKillIntruderThread then task.cancel(autoKillIntruderThread) end
+    autoKillIntruderThread = task.spawn(function()
+        while autoKillIntruderEnabled and not scriptDestroyed do
+            local myHrp = character and character:FindFirstChild("HumanoidRootPart")
+            if myHrp then
+                for p, data in pairs(intruderData) do
+                    if data.alerted then
+                        local tChar = p.Character
+                        if tChar then
+                            local tHrp = tChar:FindFirstChild("HumanoidRootPart")
+                            if tHrp then
+                                -- Teleport above intruder's head and activate bat
+                                local targetPos = tHrp.Position + Vector3.new(0, AUTOKILL_DIST, 0)
+                                myHrp.CFrame = CFrame.new(targetPos) * CFrame.Angles(math.rad(-90), 0, 0)
+
+                                -- Activate bat if equipped
+                                local bat = character:FindFirstChild("Bat")
+                                if bat and bat.Parent == character then
+                                    bat:Activate()
+                                else
+                                    local batInBag = plr.Backpack:FindFirstChild("Bat")
+                                    if batInBag then
+                                        batInBag.Parent = character
+                                        task.wait(0.05)
+                                        bat = character:FindFirstChild("Bat")
+                                        if bat then bat:Activate() end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait()
+        end
+    end)
+end
+local function stopAutoKillIntruder()
+    autoKillIntruderEnabled = false
+    if autoKillIntruderThread then task.cancel(autoKillIntruderThread); autoKillIntruderThread = nil end
+end
+
+-- PROXIMITY DETECTION: scan for players near any plot part
+local function startProximityDetection()
+    if proximityThread then task.cancel(proximityThread) end
+    proximityThread = task.spawn(function()
+        while not scriptDestroyed do
+            task.wait(0.5)
+            if not intruderAlertEnabled then continue end
+            if intruderDetectMethod ~= "Proximity" then continue end
+            if not plot then continue end
+
+            -- Get all plot part positions once
+            local plotParts = {}
+            for _, part in ipairs(plot:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    table.insert(plotParts, part)
+                end
+            end
+
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p == plr then continue end
+                local tChar = p.Character
+                if not tChar then continue end
+                local tHrp = tChar:FindFirstChild("HumanoidRootPart")
+                if not tHrp then continue end
+
+                -- Check if close to any plot part
+                local nearPlot = false
+                for _, part in ipairs(plotParts) do
+                    if (tHrp.Position - part.Position).Magnitude <= intruderProximityDist then
+                        nearPlot = true
+                        break
+                    end
+                end
+
+                if nearPlot then
+                    if not playerOnPlot[p] then
+                        playerOnPlot[p] = true
+                        playerTouchTime[p] = tick()
+                        -- Start timer
+                        local timerThread = task.spawn(function()
+                            task.wait(INTRUDER_LINGER_TIME)
+                            if playerOnPlot[p] then
+                                if not intruderData[p] then
+                                    intruderData[p] = {alerted=false,highlight=nil,billboard=nil,timerThread=nil}
+                                end
+                                triggerAlert(p)
+                            end
+                        end)
+                        if intruderData[p] then
+                            intruderData[p].timerThread = timerThread
+                        else
+                            intruderData[p] = {alerted=false,highlight=nil,billboard=nil,timerThread=timerThread}
+                        end
+                    end
+                else
+                    -- Player left proximity
+                    if playerOnPlot[p] then
+                        playerOnPlot[p] = nil
+                        playerTouchTime[p] = nil
+                        if intruderData[p] and not intruderData[p].alerted then
+                            if intruderData[p].timerThread then
+                                task.cancel(intruderData[p].timerThread)
+                            end
+                            intruderData[p] = nil
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function stopProximityDetection()
+    if proximityThread then task.cancel(proximityThread); proximityThread = nil end
+end
+
+local function applyDetectMethod(method)
+    intruderDetectMethod = method
+    -- Clear all non-alerted intruder tracking when switching modes
+    for p, data in pairs(intruderData) do
+        if not data.alerted then
+            if data.timerThread then task.cancel(data.timerThread) end
+            intruderData[p] = nil
+        end
+    end
+    for p, _ in pairs(playerOnPlot) do playerOnPlot[p] = nil end
+    for p, _ in pairs(playerTouchTime) do playerTouchTime[p] = nil end
+
+    if method == "Touch" then
+        stopProximityDetection()
+        connectPlotTouches()
+    else
+        -- Proximity mode: disconnect touch listeners
+        for _, conn in ipairs(intruderConnections) do conn:Disconnect() end
+        intruderConnections = {}
+        startProximityDetection()
+    end
+end
+
+-- Initialize touch connections
+connectPlotTouches()
+startProximityDetection() -- starts but stays idle until method = "Proximity"
 
 -- ============================================================
 --  COMPONENTS
@@ -904,13 +1701,11 @@ local function mkInput(parent, labelTxt, default, onFocusLost)
     row.Size = UDim2.new(1,0,0,38); row.BackgroundColor3 = C.SURF2
     row.BorderSizePixel = 0; row.Active = false; row.LayoutOrder = nextLO(); row.Parent = parent
     corner(row, 8); stroke(row)
-
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.55,0,1,0); lbl.Position = UDim2.new(0,12,0,0)
     lbl.BackgroundTransparency = 1; lbl.Text = labelTxt
     lbl.TextColor3 = C.TEXT; lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13
     lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Active = false; lbl.Parent = row
-
     local box = Instance.new("TextBox")
     box.Size = UDim2.new(0.36,0,0,28); box.Position = UDim2.new(0.6,0,0.5,-14)
     box.BackgroundColor3 = C.BG; box.Text = tostring(default or "")
@@ -918,28 +1713,24 @@ local function mkInput(parent, labelTxt, default, onFocusLost)
     box.ClearTextOnFocus = false; box.BorderSizePixel = 0
     box.Active = true; box.Parent = row
     corner(box, 6); stroke(box)
-    
     if onFocusLost then
         box.FocusLost:Connect(function() onFocusLost(box.Text) end)
     end
     return row, box
 end
 
--- mkInputHidden: like mkInput but the row starts invisible and height=0 to avoid gaps
 local function mkInputHidden(parent, labelTxt, default, onFocusLost)
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1,0,0,0); row.BackgroundColor3 = C.SURF2
     row.BorderSizePixel = 0; row.Active = false; row.LayoutOrder = nextLO()
-    row.ClipsDescendants = true; row.Visible = true -- Visible but 0 height
+    row.ClipsDescendants = true; row.Visible = true
     row.Parent = parent
     corner(row, 8); stroke(row)
-
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.55,0,0,38); lbl.Position = UDim2.new(0,12,0,0)
     lbl.BackgroundTransparency = 1; lbl.Text = labelTxt
     lbl.TextColor3 = C.TEXT; lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13
     lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Active = false; lbl.Parent = row
-
     local box = Instance.new("TextBox")
     box.Size = UDim2.new(0.36,0,0,28); box.Position = UDim2.new(0.6,0,0,5)
     box.BackgroundColor3 = C.BG; box.Text = tostring(default or "")
@@ -947,7 +1738,6 @@ local function mkInputHidden(parent, labelTxt, default, onFocusLost)
     box.ClearTextOnFocus = false; box.BorderSizePixel = 0
     box.Active = true; box.Parent = row
     corner(box, 6); stroke(box)
-    
     if onFocusLost then
         box.FocusLost:Connect(function() onFocusLost(box.Text) end)
     end
@@ -958,29 +1748,24 @@ local function mkDropdown(parent, labelTxt, options, default, onChange)
     local selected = default or options[1]
     local isOpen   = false
     local ITEM_H   = 32
-
     local placeholder = Instance.new("Frame")
     placeholder.Size = UDim2.new(1,0,0,38); placeholder.BackgroundTransparency = 1
     placeholder.ClipsDescendants = false; placeholder.Active = false
     placeholder.LayoutOrder = nextLO(); placeholder.Parent = parent
-
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1,0,0,38); row.BackgroundColor3 = C.SURF2
     row.BorderSizePixel = 0; row.Active = false; row.Parent = placeholder
     corner(row, 8); stroke(row)
-
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.45,0,1,0); lbl.Position = UDim2.new(0,12,0,0)
     lbl.BackgroundTransparency = 1; lbl.Text = labelTxt
     lbl.TextColor3 = C.TEXT; lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13
     lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Active = false; lbl.Parent = row
-
     local selLbl = Instance.new("TextLabel")
     selLbl.Size = UDim2.new(0.45,0,1,0); selLbl.Position = UDim2.new(0.45,0,0,0)
     selLbl.BackgroundTransparency = 1; selLbl.Text = selected
     selLbl.TextColor3 = C.ACCENT; selLbl.Font = Enum.Font.GothamBold; selLbl.TextSize = 13
     selLbl.TextXAlignment = Enum.TextXAlignment.Right; selLbl.Active = false; selLbl.Parent = row
-
     local listFrame = Instance.new("Frame")
     listFrame.Size = UDim2.new(0,0,0,0); listFrame.BackgroundColor3 = C.SURF
     listFrame.BorderSizePixel = 0; listFrame.ClipsDescendants = true
@@ -990,35 +1775,27 @@ local function mkDropdown(parent, labelTxt, options, default, onChange)
     local ll = Instance.new("UIListLayout")
     ll.Padding = UDim.new(0,2); ll.SortOrder = Enum.SortOrder.LayoutOrder; ll.Parent = listFrame
     pad(listFrame, 4, 4, 4, 4)
-
     local function toggle()
         isOpen = not isOpen
         if isOpen then
-            local abs = row.AbsolutePosition
-            local sz  = row.AbsoluteSize
+            local abs = row.AbsolutePosition; local sz = row.AbsoluteSize
             listFrame.Position = UDim2.new(0, abs.X, 0, abs.Y + sz.Y + 2)
             listFrame.Size = UDim2.new(0, sz.X, 0, 0)
             listFrame.Visible = true
             tw(listFrame, {Size=UDim2.new(0,sz.X,0, #options * (ITEM_H+2)+8)}, 0.15)
-            -- Register for live position tracking while window is dragged
             table.insert(openDropdowns, {listFrame = listFrame, row = row})
         else
             tw(listFrame, {Size=UDim2.new(0,listFrame.AbsoluteSize.X,0,0)}, 0.12)
             task.delay(0.13, function() listFrame.Visible = false end)
-            -- Unregister from tracker
             for i, entry in ipairs(openDropdowns) do
-                if entry.listFrame == listFrame then
-                    table.remove(openDropdowns, i); break
-                end
+                if entry.listFrame == listFrame then table.remove(openDropdowns, i); break end
             end
         end
     end
-
     local hit = Instance.new("TextButton")
     hit.Size = UDim2.new(1,0,1,0); hit.BackgroundTransparency = 1; hit.Text = ""
     hit.ZIndex = 10; hit.Active = true; hit.Parent = row
     hit.MouseButton1Click:Connect(toggle)
-
     for i, opt in ipairs(options) do
         local ob = Instance.new("TextButton")
         ob.Size = UDim2.new(1,0,0,ITEM_H); ob.BackgroundColor3 = C.SURF2; ob.Text = opt
@@ -1028,44 +1805,37 @@ local function mkDropdown(parent, labelTxt, options, default, onChange)
         ob.ZIndex = 101; ob.LayoutOrder = i; ob.Active = true; ob.Parent = listFrame
         corner(ob, 6)
         ob.MouseButton1Click:Connect(function()
-            selected = opt; selLbl.Text = opt
-            toggle()
+            selected = opt; selLbl.Text = opt; toggle()
             if onChange then onChange(opt) end
         end)
     end
     return placeholder, function() return selected end
 end
 
--- mkDropdownHidden: dropdown that starts with 0 height to avoid gaps
 local function mkDropdownHidden(parent, labelTxt, options, default, onChange)
     local selected = default or options[1]
     local isOpen   = false
     local ITEM_H   = 32
-
     local placeholder = Instance.new("Frame")
-    placeholder.Size = UDim2.new(1,0,0,0) -- Start at 0 height
+    placeholder.Size = UDim2.new(1,0,0,0)
     placeholder.BackgroundTransparency = 1
     placeholder.ClipsDescendants = true
     placeholder.Active = false
     placeholder.LayoutOrder = nextLO(); placeholder.Parent = parent
-
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1,0,0,38); row.BackgroundColor3 = C.SURF2
     row.BorderSizePixel = 0; row.Active = false; row.Parent = placeholder
     corner(row, 8); stroke(row)
-
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.45,0,0,38); lbl.Position = UDim2.new(0,12,0,0)
     lbl.BackgroundTransparency = 1; lbl.Text = labelTxt
     lbl.TextColor3 = C.TEXT; lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13
     lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Active = false; lbl.Parent = row
-
     local selLbl = Instance.new("TextLabel")
     selLbl.Size = UDim2.new(0.45,0,0,38); selLbl.Position = UDim2.new(0.45,0,0,0)
     selLbl.BackgroundTransparency = 1; selLbl.Text = selected
     selLbl.TextColor3 = C.ACCENT; selLbl.Font = Enum.Font.GothamBold; selLbl.TextSize = 13
     selLbl.TextXAlignment = Enum.TextXAlignment.Right; selLbl.Active = false; selLbl.Parent = row
-
     local listFrame = Instance.new("Frame")
     listFrame.Size = UDim2.new(0,0,0,0); listFrame.BackgroundColor3 = C.SURF
     listFrame.BorderSizePixel = 0; listFrame.ClipsDescendants = true
@@ -1075,12 +1845,10 @@ local function mkDropdownHidden(parent, labelTxt, options, default, onChange)
     local ll = Instance.new("UIListLayout")
     ll.Padding = UDim.new(0,2); ll.SortOrder = Enum.SortOrder.LayoutOrder; ll.Parent = listFrame
     pad(listFrame, 4, 4, 4, 4)
-
     local function toggle()
         isOpen = not isOpen
         if isOpen then
-            local abs = row.AbsolutePosition
-            local sz  = row.AbsoluteSize
+            local abs = row.AbsolutePosition; local sz = row.AbsoluteSize
             listFrame.Position = UDim2.new(0, abs.X, 0, abs.Y + sz.Y + 2)
             listFrame.Size = UDim2.new(0, sz.X, 0, 0)
             listFrame.Visible = true
@@ -1090,19 +1858,15 @@ local function mkDropdownHidden(parent, labelTxt, options, default, onChange)
             tw(listFrame, {Size=UDim2.new(0,listFrame.AbsoluteSize.X,0,0)}, 0.12)
             task.delay(0.13, function() listFrame.Visible = false end)
             for i, entry in ipairs(openDropdowns) do
-                if entry.listFrame == listFrame then
-                    table.remove(openDropdowns, i); break
-                end
+                if entry.listFrame == listFrame then table.remove(openDropdowns, i); break end
             end
         end
     end
-
     local hit = Instance.new("TextButton")
     hit.Size = UDim2.new(1,0,0,38); hit.Position = UDim2.new(0,0,0,0)
     hit.BackgroundTransparency = 1; hit.Text = ""
     hit.ZIndex = 10; hit.Active = true; hit.Parent = row
     hit.MouseButton1Click:Connect(toggle)
-
     for i, opt in ipairs(options) do
         local ob = Instance.new("TextButton")
         ob.Size = UDim2.new(1,0,0,ITEM_H); ob.BackgroundColor3 = C.SURF2; ob.Text = opt
@@ -1112,25 +1876,379 @@ local function mkDropdownHidden(parent, labelTxt, options, default, onChange)
         ob.ZIndex = 101; ob.LayoutOrder = i; ob.Active = true; ob.Parent = listFrame
         corner(ob, 6)
         ob.MouseButton1Click:Connect(function()
-            selected = opt; selLbl.Text = opt
-            toggle()
+            selected = opt; selLbl.Text = opt; toggle()
             if onChange then onChange(opt) end
         end)
     end
-
     local function show(v)
         if v then
             tw(placeholder, {Size = UDim2.new(1,0,0,38+6)}, 0.15)
         else
-            -- Close dropdown first if open
             if isOpen then toggle() end
             tw(placeholder, {Size = UDim2.new(1,0,0,0)}, 0.12)
         end
     end
-
     return placeholder, function() return selected end, show
 end
 
+-- Multi-select dropdown: expands inline (no floating overlay), Done button closes it
+-- Returns: placeholder frame, getSelected function
+local function mkMultiDropdown(parent, labelTxt, options, defaults, onChange)
+    local selected = {}
+    if defaults then
+        for _, v in ipairs(defaults) do selected[v] = true end
+    end
+    local ITEM_H  = 34
+    local isOpen  = false
+
+    local function getSelected()
+        local t = {}
+        for _, opt in ipairs(options) do
+            if selected[opt] then table.insert(t, opt) end
+        end
+        return t
+    end
+
+    local function makeLabel()
+        local t = getSelected()
+        if #t == 0 then return "All" end
+        if #t == #options then return "All" end
+        if #t == 1 then return t[1] end
+        return #t .. " selected"
+    end
+
+    -- Outer wrapper that grows when open
+    local HEADER_H  = 38
+    local FOOTER_H  = 34
+    local ITEMS_GAP = 4
+    local openHeight = HEADER_H + ITEMS_GAP + #options * (ITEM_H + 2) + FOOTER_H + 8
+
+    local placeholder = Instance.new("Frame")
+    placeholder.Size = UDim2.new(1, 0, 0, HEADER_H)
+    placeholder.BackgroundTransparency = 1
+    placeholder.ClipsDescendants = true
+    placeholder.Active = false
+    placeholder.LayoutOrder = nextLO()
+    placeholder.Parent = parent
+
+    -- Header row (always visible)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, HEADER_H)
+    row.Position = UDim2.new(0, 0, 0, 0)
+    row.BackgroundColor3 = C.SURF2
+    row.BorderSizePixel = 0
+    row.Active = false
+    row.Parent = placeholder
+    corner(row, 8)
+    stroke(row)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0.42, 0, 1, 0)
+    lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = labelTxt
+    lbl.TextColor3 = C.TEXT
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Active = false
+    lbl.Parent = row
+
+    local selLbl = Instance.new("TextLabel")
+    selLbl.Size = UDim2.new(0.52, 0, 1, 0)
+    selLbl.Position = UDim2.new(0.42, 0, 0, 0)
+    selLbl.BackgroundTransparency = 1
+    selLbl.Text = makeLabel()
+    selLbl.TextColor3 = C.ACCENT
+    selLbl.Font = Enum.Font.GothamBold
+    selLbl.TextSize = 12
+    selLbl.TextXAlignment = Enum.TextXAlignment.Right
+    selLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    selLbl.Active = false
+    selLbl.Parent = row
+
+    -- Items container (appears below header when open)
+    local itemsFrame = Instance.new("Frame")
+    itemsFrame.Size = UDim2.new(1, 0, 0, #options * (ITEM_H + 2) + FOOTER_H + 8)
+    itemsFrame.Position = UDim2.new(0, 0, 0, HEADER_H + ITEMS_GAP)
+    itemsFrame.BackgroundColor3 = C.SURF
+    itemsFrame.BorderSizePixel = 0
+    itemsFrame.Visible = false
+    itemsFrame.Active = false
+    itemsFrame.Parent = placeholder
+    corner(itemsFrame, 8)
+    stroke(itemsFrame)
+
+    local ll = Instance.new("UIListLayout")
+    ll.Padding = UDim.new(0, 2)
+    ll.SortOrder = Enum.SortOrder.LayoutOrder
+    ll.Parent = itemsFrame
+    pad(itemsFrame, 4, 4, 4, 4)
+
+    -- Item buttons
+    for i, opt in ipairs(options) do
+        local ob = Instance.new("Frame")
+        ob.Size = UDim2.new(1, 0, 0, ITEM_H)
+        ob.BackgroundColor3 = selected[opt] and Color3.fromRGB(35, 55, 90) or C.SURF2
+        ob.BorderSizePixel = 0
+        ob.LayoutOrder = i
+        ob.Parent = itemsFrame
+        corner(ob, 6)
+
+        local checkLbl = Instance.new("TextLabel")
+        checkLbl.Size = UDim2.new(0, 22, 1, 0)
+        checkLbl.Position = UDim2.new(0, 6, 0, 0)
+        checkLbl.BackgroundTransparency = 1
+        checkLbl.Text = selected[opt] and "✓" or ""
+        checkLbl.TextColor3 = C.ACCENT
+        checkLbl.Font = Enum.Font.GothamBold
+        checkLbl.TextSize = 13
+        checkLbl.ZIndex = 2
+        checkLbl.Parent = ob
+
+        local optLbl = Instance.new("TextLabel")
+        optLbl.Size = UDim2.new(1, -30, 1, 0)
+        optLbl.Position = UDim2.new(0, 28, 0, 0)
+        optLbl.BackgroundTransparency = 1
+        optLbl.Text = opt
+        optLbl.TextColor3 = selected[opt] and C.ACCENT or C.TEXT
+        optLbl.Font = Enum.Font.Gotham
+        optLbl.TextSize = 13
+        optLbl.TextXAlignment = Enum.TextXAlignment.Left
+        optLbl.ZIndex = 2
+        optLbl.Parent = ob
+
+        local hitBtn = Instance.new("TextButton")
+        hitBtn.Size = UDim2.new(1, 0, 1, 0)
+        hitBtn.BackgroundTransparency = 1
+        hitBtn.Text = ""
+        hitBtn.ZIndex = 3
+        hitBtn.Active = true
+        hitBtn.Parent = ob
+
+        hitBtn.MouseButton1Click:Connect(function()
+            if selected[opt] then
+                selected[opt] = nil
+                checkLbl.Text = ""
+                optLbl.TextColor3 = C.TEXT
+                ob.BackgroundColor3 = C.SURF2
+            else
+                selected[opt] = true
+                checkLbl.Text = "✓"
+                optLbl.TextColor3 = C.ACCENT
+                ob.BackgroundColor3 = Color3.fromRGB(35, 55, 90)
+            end
+            selLbl.Text = makeLabel()
+            if onChange then onChange(getSelected()) end
+        end)
+    end
+
+    -- Done button (bottom of items frame)
+    local doneBtn = Instance.new("TextButton")
+    doneBtn.Size = UDim2.new(1, -8, 0, 26)
+    doneBtn.BackgroundColor3 = C.SUCCESS
+    doneBtn.Text = "✓ Done"
+    doneBtn.TextColor3 = Color3.new(1, 1, 1)
+    doneBtn.Font = Enum.Font.GothamBold
+    doneBtn.TextSize = 12
+    doneBtn.BorderSizePixel = 0
+    doneBtn.AutoButtonColor = false
+    doneBtn.LayoutOrder = #options + 1
+    doneBtn.Parent = itemsFrame
+    corner(doneBtn, 7)
+
+    local function close()
+        isOpen = false
+        itemsFrame.Visible = false
+        tw(placeholder, {Size = UDim2.new(1, 0, 0, HEADER_H)}, 0.15)
+        -- Fix row corners to be fully rounded again when closed
+        tw(row, {BackgroundColor3 = C.SURF2}, 0.1)
+    end
+
+    local function open()
+        isOpen = true
+        itemsFrame.Visible = true
+        tw(placeholder, {Size = UDim2.new(1, 0, 0, openHeight)}, 0.18)
+    end
+
+    -- Hit area on the header row
+    local hit = Instance.new("TextButton")
+    hit.Size = UDim2.new(1, 0, 1, 0)
+    hit.BackgroundTransparency = 1
+    hit.Text = ""
+    hit.ZIndex = 5
+    hit.Active = true
+    hit.Parent = row
+    hit.MouseButton1Click:Connect(function()
+        if isOpen then close() else open() end
+    end)
+
+    doneBtn.MouseButton1Click:Connect(function()
+        close()
+    end)
+
+    return placeholder, getSelected
+end
+
+-- Hidden multi-select dropdown: starts collapsed (height 0), shown/hidden via show()
+-- Returns: placeholder, getSelected, show(bool)
+local function mkMultiDropdownHidden(parent, labelTxt, options, defaults, onChange)
+    local selected = {}
+    if defaults then
+        for _, v in ipairs(defaults) do selected[v] = true end
+    end
+    local ITEM_H    = 34
+    local HEADER_H  = 38
+    local FOOTER_H  = 34
+    local ITEMS_GAP = 4
+    local isOpen    = false
+    local isVisible = false
+    local openHeight = HEADER_H + ITEMS_GAP + #options * (ITEM_H + 2) + FOOTER_H + 8
+
+    local function getSelected()
+        local t = {}
+        for _, opt in ipairs(options) do
+            if selected[opt] then table.insert(t, opt) end
+        end
+        return t
+    end
+    local function makeLabel()
+        local t = getSelected()
+        if #t == 0 then return "All" end
+        if #t == #options then return "All" end
+        if #t == 1 then return t[1] end
+        return #t .. " selected"
+    end
+
+    local placeholder = Instance.new("Frame")
+    placeholder.Size = UDim2.new(1, 0, 0, 0)
+    placeholder.BackgroundTransparency = 1
+    placeholder.ClipsDescendants = true
+    placeholder.Active = false
+    placeholder.LayoutOrder = nextLO()
+    placeholder.Parent = parent
+
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, HEADER_H)
+    row.Position = UDim2.new(0, 0, 0, 0)
+    row.BackgroundColor3 = C.SURF2
+    row.BorderSizePixel = 0
+    row.Active = false
+    row.Parent = placeholder
+    corner(row, 8); stroke(row)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0.42, 0, 1, 0)
+    lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = labelTxt
+    lbl.TextColor3 = C.TEXT; lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Active = false; lbl.Parent = row
+
+    local selLbl = Instance.new("TextLabel")
+    selLbl.Size = UDim2.new(0.52, 0, 1, 0)
+    selLbl.Position = UDim2.new(0.42, 0, 0, 0)
+    selLbl.BackgroundTransparency = 1
+    selLbl.Text = makeLabel()
+    selLbl.TextColor3 = C.ACCENT; selLbl.Font = Enum.Font.GothamBold; selLbl.TextSize = 12
+    selLbl.TextXAlignment = Enum.TextXAlignment.Right
+    selLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    selLbl.Active = false; selLbl.Parent = row
+
+    local itemsFrame = Instance.new("Frame")
+    itemsFrame.Size = UDim2.new(1, 0, 0, #options * (ITEM_H + 2) + FOOTER_H + 8)
+    itemsFrame.Position = UDim2.new(0, 0, 0, HEADER_H + ITEMS_GAP)
+    itemsFrame.BackgroundColor3 = C.SURF
+    itemsFrame.BorderSizePixel = 0
+    itemsFrame.Visible = false
+    itemsFrame.Active = false
+    itemsFrame.Parent = placeholder
+    corner(itemsFrame, 8); stroke(itemsFrame)
+
+    local ll = Instance.new("UIListLayout")
+    ll.Padding = UDim.new(0, 2); ll.SortOrder = Enum.SortOrder.LayoutOrder; ll.Parent = itemsFrame
+    pad(itemsFrame, 4, 4, 4, 4)
+
+    for i, opt in ipairs(options) do
+        local ob = Instance.new("Frame")
+        ob.Size = UDim2.new(1, 0, 0, ITEM_H)
+        ob.BackgroundColor3 = selected[opt] and Color3.fromRGB(35,55,90) or C.SURF2
+        ob.BorderSizePixel = 0; ob.LayoutOrder = i; ob.Parent = itemsFrame
+        corner(ob, 6)
+
+        local checkLbl = Instance.new("TextLabel")
+        checkLbl.Size = UDim2.new(0,22,1,0); checkLbl.Position = UDim2.new(0,6,0,0)
+        checkLbl.BackgroundTransparency = 1
+        checkLbl.Text = selected[opt] and "✓" or ""
+        checkLbl.TextColor3 = C.ACCENT; checkLbl.Font = Enum.Font.GothamBold
+        checkLbl.TextSize = 13; checkLbl.ZIndex = 2; checkLbl.Parent = ob
+
+        local optLbl = Instance.new("TextLabel")
+        optLbl.Size = UDim2.new(1,-30,1,0); optLbl.Position = UDim2.new(0,28,0,0)
+        optLbl.BackgroundTransparency = 1; optLbl.Text = opt
+        optLbl.TextColor3 = selected[opt] and C.ACCENT or C.TEXT
+        optLbl.Font = Enum.Font.Gotham; optLbl.TextSize = 13
+        optLbl.TextXAlignment = Enum.TextXAlignment.Left
+        optLbl.ZIndex = 2; optLbl.Parent = ob
+
+        local hitBtn = Instance.new("TextButton")
+        hitBtn.Size = UDim2.new(1,0,1,0); hitBtn.BackgroundTransparency = 1
+        hitBtn.Text = ""; hitBtn.ZIndex = 3; hitBtn.Active = true; hitBtn.Parent = ob
+        hitBtn.MouseButton1Click:Connect(function()
+            if selected[opt] then
+                selected[opt] = nil; checkLbl.Text = ""
+                optLbl.TextColor3 = C.TEXT; ob.BackgroundColor3 = C.SURF2
+            else
+                selected[opt] = true; checkLbl.Text = "✓"
+                optLbl.TextColor3 = C.ACCENT; ob.BackgroundColor3 = Color3.fromRGB(35,55,90)
+            end
+            selLbl.Text = makeLabel()
+            if onChange then onChange(getSelected()) end
+        end)
+    end
+
+    local doneBtn = Instance.new("TextButton")
+    doneBtn.Size = UDim2.new(1,-8,0,26)
+    doneBtn.BackgroundColor3 = C.SUCCESS
+    doneBtn.Text = "✓ Done"; doneBtn.TextColor3 = Color3.new(1,1,1)
+    doneBtn.Font = Enum.Font.GothamBold; doneBtn.TextSize = 12
+    doneBtn.BorderSizePixel = 0; doneBtn.AutoButtonColor = false
+    doneBtn.LayoutOrder = #options + 1; doneBtn.Parent = itemsFrame
+    corner(doneBtn, 7)
+
+    local function closeItems()
+        isOpen = false
+        itemsFrame.Visible = false
+        tw(placeholder, {Size = UDim2.new(1,0,0,HEADER_H)}, 0.15)
+    end
+    local function openItems()
+        isOpen = true
+        itemsFrame.Visible = true
+        tw(placeholder, {Size = UDim2.new(1,0,0,openHeight)}, 0.18)
+    end
+
+    local hit = Instance.new("TextButton")
+    hit.Size = UDim2.new(1,0,1,0); hit.BackgroundTransparency = 1; hit.Text = ""
+    hit.ZIndex = 5; hit.Active = true; hit.Parent = row
+    hit.MouseButton1Click:Connect(function()
+        if not isVisible then return end
+        if isOpen then closeItems() else openItems() end
+    end)
+    doneBtn.MouseButton1Click:Connect(closeItems)
+
+    -- show(bool): expand/collapse entire widget
+    local function show(v)
+        isVisible = v
+        if v then
+            tw(placeholder, {Size = UDim2.new(1,0,0,HEADER_H)}, 0.15)
+        else
+            if isOpen then closeItems() end
+            tw(placeholder, {Size = UDim2.new(1,0,0,0)}, 0.12)
+        end
+    end
+
+    return placeholder, getSelected, show
+end
 local function mkToggle(parent, text, init, onChange)
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1,0,0,38); row.BackgroundColor3 = C.SURF2
@@ -1169,11 +2287,9 @@ end
 --  BUILD UI CONTENT
 -- ============================================================
 
--- STOP BUTTON
 mkSpacer(4)
 mkBtn(scroll, "⛔ STOP CURRENT ACTION", C.DANGER).MouseButton1Click:Connect(function()
     abortTasks = true
-    print("-- [PongHub] Abort requested.")
 end)
 mkInput(scroll, "Action Delay (Sec)", tostring(actionDelay), function(txt)
     local n = tonumber(txt)
@@ -1210,18 +2326,21 @@ local rars = {"All","Common","Uncommon","Rare","Epic","Legendary","Mythical","Se
 local muts = {"All","Normal","Golden","Diamond","Ruby","Neon","Lightning"}
 local rets = {"Last Position", "Plot Spawn"}
 
+-- Rarity/mutation options without "All" for multi-select (All = nothing ticked)
+local rarsMulti = {"Common","Uncommon","Rare","Epic","Legendary","Mythical","Secret","Celestial","Divine"}
+local mutsMulti = {"Normal","Golden","Diamond","Ruby","Neon","Lightning"}
+
 mkSection("📦", "PICK UP")
-mkDropdown(scroll, "Rarity", rars, "Divine", function(v) autoPickUpRarity = v end)
-mkDropdown(scroll, "Mutation", muts, "All", function(v) autoPickUpMutation = v end)
+mkMultiDropdown(scroll, "Rarities", rarsMulti, {"Divine"}, function(v) autoPickUpRarities = v end)
+mkMultiDropdown(scroll, "Mutations", mutsMulti, {}, function(v) autoPickUpMutations = v end)
 mkDropdown(scroll, "Return To", rets, "Last Position", function(v) pickUpReturn = v end)
 mkDropdown(scroll, "Method", {"FireProximity", "HoldPrompt"}, "FireProximity", function(v) pickUpMethod = v end)
 mkInput(scroll, "Carry Amount (1-6)", tostring(carryAmount), function(txt)
     local n = tonumber(txt)
     if n then carryAmount = math.max(1, math.min(6, math.floor(n))) end
 end)
-
 mkBtn(scroll, "📦  Pick Up Now", C.ACCENT).MouseButton1Click:Connect(function()
-    task.spawn(function() pickUp(autoPickUpRarity, autoPickUpMutation) end)
+    task.spawn(function() pickUp(autoPickUpRarities, autoPickUpMutations) end)
 end)
 mkToggle(scroll, "Auto Pick Up", false, function(v)
     autoPickUpEnabled = v; if v then startAutoPickUp() else stopAutoPickUp() end
@@ -1234,89 +2353,101 @@ local _, lvlBox = mkInput(scroll, "Target Level", "25")
 mkBtn(scroll, "⬆  Upgrade All Slots", C.ACCENT2).MouseButton1Click:Connect(function()
     task.spawn(function() upgradeAll(tonumber(lvlBox.Text) or 25) end)
 end)
+mkBtn(scroll, "🎯  Upgrade Slot In Front", C.ACCENT).MouseButton1Click:Connect(function()
+    task.spawn(function() upgradeSlotInFront(tonumber(lvlBox.Text) or 25) end)
+end)
 mkSpacer(4); mkSep(); mkSpacer(4)
 
 -- SELL
 mkSection("💵", "SELL")
-
--- Sell type dropdown - drives visibility of custom fields
-local sellTypeOptions = {"Equipped", "Inventory", "Custom"}
-
--- Custom fields (hidden by default)
-local customRarDD, getCustomRar, showCustomRar = mkDropdownHidden(scroll, "Rarity", rars, "All", function(v)
-    sellCustomRarity = v
+local customRarDD, getCustomRar, showCustomRar = mkMultiDropdownHidden(scroll, "Rarities", rarsMulti, {}, function(v)
+    sellCustomRarities = v
 end)
-local customMutDD, getCustomMut, showCustomMut = mkDropdownHidden(scroll, "Mutation", muts, "All", function(v)
-    sellCustomMutation = v
+local customMutDD, getCustomMut, showCustomMut = mkMultiDropdownHidden(scroll, "Mutations", mutsMulti, {}, function(v)
+    sellCustomMutations = v
 end)
-
--- Hidden level input
 local customLvlRow, customLvlBox = mkInputHidden(scroll, "Level", "", function(txt)
     sellCustomLevel = txt
 end)
-
 local function setCustomVisible(visible)
-    showCustomRar(visible)
-    showCustomMut(visible)
-    if visible then
-        tw(customLvlRow, {Size = UDim2.new(1,0,0,38)}, 0.15)
-    else
-        tw(customLvlRow, {Size = UDim2.new(1,0,0,0)}, 0.12)
-    end
+    showCustomRar(visible); showCustomMut(visible)
+    if visible then tw(customLvlRow, {Size = UDim2.new(1,0,0,38)}, 0.15)
+    else tw(customLvlRow, {Size = UDim2.new(1,0,0,0)}, 0.12) end
 end
-
--- Sell type dropdown (placed above the hidden rows by LayoutOrder)
--- We need to insert BEFORE the hidden rows, so we save LayoutOrder before them
--- Re-assign the sell dropdown's LayoutOrder to come before custom fields
+mkInput(scroll, "Sell Delay (Sec)", tostring(sellTeleportDelay), function(txt)
+    local n = tonumber(txt)
+    if n and n >= 0 then sellTeleportDelay = n end
+end)
 local sellTypeDD = Instance.new("Frame")
-sellTypeDD.Size = UDim2.new(1,0,0,38); sellTypeDD.BackgroundTransparency = 1
-sellTypeDD.ClipsDescendants = false; sellTypeDD.Active = false
+sellTypeDD.Size = UDim2.new(1,0,0,38)
+sellTypeDD.BackgroundTransparency = 1
+sellTypeDD.ClipsDescendants = false
+sellTypeDD.Active = false
 sellTypeDD.LayoutOrder = nextLO()
-
--- Move customRarDD, customMutDD, customLvlRow AFTER the sell type in layout order
--- (they were already created with nextLO so order is correct: sellTypeDD -> rarDD -> mutDD -> lvlRow)
--- Actually, we need sellTypeDD first. Let's set its LayoutOrder manually before the others.
--- Since mkDropdownHidden already called nextLO() to reserve numbers, we insert sellTypeDD parent now.
 sellTypeDD.Parent = scroll
 
-do
+local function buildSellTypeDropdown()
     local isOpen = false
     local ITEM_H = 32
-    local options = sellTypeOptions
+    local options = {"Equipped", "Inventory", "Custom"}
     local selected = "Equipped"
 
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1,0,0,38); row.BackgroundColor3 = C.SURF2
-    row.BorderSizePixel = 0; row.Active = false; row.Parent = sellTypeDD
-    corner(row, 8); stroke(row)
+    row.Size = UDim2.new(1,0,0,38)
+    row.BackgroundColor3 = C.SURF2
+    row.BorderSizePixel = 0
+    row.Active = false
+    row.Parent = sellTypeDD
+    corner(row, 8)
+    stroke(row)
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(0.45,0,1,0); lbl.Position = UDim2.new(0,12,0,0)
-    lbl.BackgroundTransparency = 1; lbl.Text = "Sell Type"
-    lbl.TextColor3 = C.TEXT; lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13
-    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Active = false; lbl.Parent = row
+    lbl.Size = UDim2.new(0.45,0,1,0)
+    lbl.Position = UDim2.new(0,12,0,0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = "Sell Type"
+    lbl.TextColor3 = C.TEXT
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Active = false
+    lbl.Parent = row
 
     local selLbl = Instance.new("TextLabel")
-    selLbl.Size = UDim2.new(0.45,0,1,0); selLbl.Position = UDim2.new(0.45,0,0,0)
-    selLbl.BackgroundTransparency = 1; selLbl.Text = selected
-    selLbl.TextColor3 = C.ACCENT; selLbl.Font = Enum.Font.GothamBold; selLbl.TextSize = 13
-    selLbl.TextXAlignment = Enum.TextXAlignment.Right; selLbl.Active = false; selLbl.Parent = row
+    selLbl.Size = UDim2.new(0.45,0,1,0)
+    selLbl.Position = UDim2.new(0.45,0,0,0)
+    selLbl.BackgroundTransparency = 1
+    selLbl.Text = selected
+    selLbl.TextColor3 = C.ACCENT
+    selLbl.Font = Enum.Font.GothamBold
+    selLbl.TextSize = 13
+    selLbl.TextXAlignment = Enum.TextXAlignment.Right
+    selLbl.Active = false
+    selLbl.Parent = row
 
     local listFrame = Instance.new("Frame")
-    listFrame.Size = UDim2.new(0,0,0,0); listFrame.BackgroundColor3 = C.SURF
-    listFrame.BorderSizePixel = 0; listFrame.ClipsDescendants = true
-    listFrame.ZIndex = 100; listFrame.Visible = false
-    listFrame.Active = true; listFrame.Parent = dropOverlay
-    corner(listFrame, 8); stroke(listFrame)
+    listFrame.Size = UDim2.new(0,0,0,0)
+    listFrame.BackgroundColor3 = C.SURF
+    listFrame.BorderSizePixel = 0
+    listFrame.ClipsDescendants = true
+    listFrame.ZIndex = 100
+    listFrame.Visible = false
+    listFrame.Active = true
+    listFrame.Parent = dropOverlay
+    corner(listFrame, 8)
+    stroke(listFrame)
+
     local ll = Instance.new("UIListLayout")
-    ll.Padding = UDim.new(0,2); ll.SortOrder = Enum.SortOrder.LayoutOrder; ll.Parent = listFrame
+    ll.Padding = UDim.new(0,2)
+    ll.SortOrder = Enum.SortOrder.LayoutOrder
+    ll.Parent = listFrame
     pad(listFrame, 4, 4, 4, 4)
 
     local function toggle()
         isOpen = not isOpen
         if isOpen then
             local abs = row.AbsolutePosition
-            local sz  = row.AbsoluteSize
+            local sz = row.AbsoluteSize
             listFrame.Position = UDim2.new(0, abs.X, 0, abs.Y + sz.Y + 2)
             listFrame.Size = UDim2.new(0, sz.X, 0, 0)
             listFrame.Visible = true
@@ -1327,38 +2458,50 @@ do
             task.delay(0.13, function() listFrame.Visible = false end)
             for i, entry in ipairs(openDropdowns) do
                 if entry.listFrame == listFrame then
-                    table.remove(openDropdowns, i); break
+                    table.remove(openDropdowns, i)
+                    break
                 end
             end
         end
     end
 
     local hit = Instance.new("TextButton")
-    hit.Size = UDim2.new(1,0,1,0); hit.BackgroundTransparency = 1; hit.Text = ""
-    hit.ZIndex = 10; hit.Active = true; hit.Parent = row
+    hit.Size = UDim2.new(1,0,1,0)
+    hit.BackgroundTransparency = 1
+    hit.Text = ""
+    hit.ZIndex = 10
+    hit.Active = true
+    hit.Parent = row
     hit.MouseButton1Click:Connect(toggle)
 
     for i, opt in ipairs(options) do
         local ob = Instance.new("TextButton")
-        ob.Size = UDim2.new(1,0,0,ITEM_H); ob.BackgroundColor3 = C.SURF2; ob.Text = opt
+        ob.Size = UDim2.new(1,0,0,ITEM_H)
+        ob.BackgroundColor3 = C.SURF2
+        ob.Text = opt
         ob.TextColor3 = (opt == selected) and C.ACCENT or C.TEXT
-        ob.Font = Enum.Font.Gotham; ob.TextSize = 13
-        ob.AutoButtonColor = false; ob.BorderSizePixel = 0
-        ob.ZIndex = 101; ob.LayoutOrder = i; ob.Active = true; ob.Parent = listFrame
+        ob.Font = Enum.Font.Gotham
+        ob.TextSize = 13
+        ob.AutoButtonColor = false
+        ob.BorderSizePixel = 0
+        ob.ZIndex = 101
+        ob.LayoutOrder = i
+        ob.Active = true
+        ob.Parent = listFrame
         corner(ob, 6)
         ob.MouseButton1Click:Connect(function()
-            selected = opt; selLbl.Text = opt; sellType = opt
+            selected = opt
+            selLbl.Text = opt
+            sellType = opt
             toggle()
             setCustomVisible(opt == "Custom")
         end)
     end
 end
-
--- Move custom hidden rows' LayoutOrder AFTER the sell type dropdown
--- (already done since sellTypeDD was created before them with nextLO reserving slots)
+buildSellTypeDropdown()
 
 mkBtn(scroll, "💵  Sell Now", C.SELL, C.BG).MouseButton1Click:Connect(function()
-    doSell(sellType, sellCustomMutation, sellCustomRarity, sellCustomLevel)
+    doSell(sellType, sellCustomMutations, sellCustomRarities, sellCustomLevel)
 end)
 mkToggle(scroll, "Auto Sell", false, function(v)
     autoSellEnabled = v; if v then startAutoSell() else stopAutoSell() end
@@ -1394,12 +2537,114 @@ mkToggle(scroll, "Auto Rebirth", false, function(v)
 end)
 mkSpacer(4); mkSep(); mkSpacer(4)
 
--- MISC
-mkSection("⚙", "MISC")
+-- VISUALS
+mkSection("👁", "VISUALS")
+
+mkToggle(scroll, "⚡ Boost FPS", false, function(v)
+    fpsBoostEnabled = v
+    if v then applyFpsBoost() else removeFpsBoost() end
+end)
+
+mkToggle(scroll, "👤 Player ESP", false, function(v)
+    playerEspEnabled = v
+    if v then enablePlayerEsp() else disablePlayerEsp() end
+end)
+
+-- Item ESP with multi-select rarity + mutation
+mkToggle(scroll, "📦 Item ESP", false, function(v)
+    itemEspEnabled = v
+    if v then startItemEsp() else stopItemEsp() end
+end)
+mkMultiDropdown(scroll, "Item ESP Rarities", rarsMulti, {}, function(v)
+    itemEspRarities = v
+    if itemEspEnabled then refreshItemEsp() end
+end)
+mkMultiDropdown(scroll, "Item ESP Mutations", mutsMulti, {}, function(v)
+    itemEspMutations = v
+    if itemEspEnabled then refreshItemEsp() end
+end)
+
+mkToggle(scroll, "💀 Boss ESP", false, function(v)
+    bossEspEnabled = v
+    if v then enableBossEsp() else disableBossEsp() end
+end)
+
+mkSpacer(4); mkSep(); mkSpacer(4)
+
+-- STATS (set leaderstats + HUD labels)
+mkSection("📊", "STATS")
+
+mkInput(scroll, "Set Money", "", function(txt)
+    local n = tonumber(txt)
+    if not n then return end
+    setLeaderstat("Money", n)
+    setHudLabel("Money", txt)
+end)
+mkInput(scroll, "Set Speed", "", function(txt)
+    local n = tonumber(txt)
+    if not n then return end
+    setLeaderstat("Speed", n)
+    setHudLabel("Speed", txt)
+end)
+mkInput(scroll, "Set Wins (HUD only)", "", function(txt)
+    local n = tonumber(txt)
+    if not n then return end
+    -- Wins only has a HUD label, no leaderstats entry to set
+    setHudLabel("Wins", txt)
+end)
+mkInput(scroll, "Set Rebirth (stat only)", "", function(txt)
+    local n = tonumber(txt)
+    if not n then return end
+    -- Rebirth has no HUD label
+    setLeaderstat("Rebirth", n)
+end)
+
+-- Alert Detection Method dropdown
+mkDropdown(scroll, "Alert Detection", {"Touch", "Proximity"}, "Touch", function(v)
+    if intruderAlertEnabled then
+        applyDetectMethod(v)
+    else
+        intruderDetectMethod = v
+    end
+end)
+
+-- Proximity distance input (relevant when Proximity mode is selected)
+mkInput(scroll, "Proximity Dist (Studs)", tostring(intruderProximityDist), function(txt)
+    local n = tonumber(txt)
+    if n and n > 0 then intruderProximityDist = n end
+end)
+
+-- Intruder Alert Toggle
+mkToggle(scroll, "🚨 Plot Intruder Alert", true, function(v)
+    intruderAlertEnabled = v
+    if not v then
+        for p, data in pairs(intruderData) do
+            if data.highlight and data.highlight.Parent then data.highlight:Destroy(); data.highlight = nil end
+            if data.billboard and data.billboard.Parent then data.billboard:Destroy(); data.billboard = nil end
+        end
+        stopProximityDetection()
+        for _, conn in ipairs(intruderConnections) do conn:Disconnect() end
+        intruderConnections = {}
+    else
+        applyDetectMethod(intruderDetectMethod)
+    end
+end)
+
+-- Auto Kill Intruder Toggle (in Misc)
+mkToggle(scroll, "⚔ Auto Kill Intruder", false, function(v)
+    autoKillIntruderEnabled = v
+    if v then startAutoKillIntruder() else stopAutoKillIntruder() end
+end)
+
 mkBtn(scroll, "💀  Destroy GUI", C.DANGER).MouseButton1Click:Connect(function()
     scriptDestroyed = true
     stopAutoCollect(); stopAutoDestroy(); stopAutoPickUp(); stopAutoRebirth()
     stopAutoSell(); stopAutoSpeed(); stopAutoVip(); stopAutoBoss()
+    stopAutoKillIntruder(); stopProximityDetection()
+    stopItemEsp(); disablePlayerEsp(); disableBossEsp()
+    if fpsBoostEnabled then removeFpsBoost() end
+    for p, _ in pairs(intruderData) do clearIntruder(p) end
+    for _, conn in ipairs(intruderConnections) do conn:Disconnect() end
     screenGui:Destroy()
 end)
 mkSpacer(4); mkSep(); mkSpacer(4)
@@ -1407,26 +2652,34 @@ mkSpacer(4); mkSep(); mkSpacer(4)
 -- CREDITS
 mkSection("★", "CREDITS")
 
-do
-    -- Credits text
+local function buildCredits()
     local creditLbl = Instance.new("TextLabel")
-    creditLbl.Size = UDim2.new(1,0,0,28); creditLbl.BackgroundTransparency = 1
-    creditLbl.Text = "pong hub v2 - made by pong"
-    creditLbl.TextColor3 = C.MUTED; creditLbl.Font = Enum.Font.Gotham; creditLbl.TextSize = 12
+    creditLbl.Size = UDim2.new(1,0,0,28)
+    creditLbl.BackgroundTransparency = 1
+    creditLbl.Text = "pong hub v2 - made by pongwx23"
+    creditLbl.TextColor3 = C.MUTED
+    creditLbl.Font = Enum.Font.Gotham
+    creditLbl.TextSize = 12
     creditLbl.TextXAlignment = Enum.TextXAlignment.Center
-    creditLbl.Active = false; creditLbl.LayoutOrder = nextLO(); creditLbl.Parent = scroll
+    creditLbl.Active = false
+    creditLbl.LayoutOrder = nextLO()
+    creditLbl.Parent = scroll
 
-    -- Helper: icon button with image on left edge
     local function mkIconBtn(iconId, btnText, bgCol, callback)
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1,0,0,38); btn.BackgroundColor3 = bgCol or C.SURF2
-        btn.TextColor3 = C.TEXT; btn.Text = btnText
-        btn.Font = Enum.Font.GothamBold; btn.TextSize = 13
-        btn.AutoButtonColor = false; btn.BorderSizePixel = 0
-        btn.Active = true; btn.LayoutOrder = nextLO(); btn.Parent = scroll
-        corner(btn, 8); stroke(btn)
-
-        -- Icon image on left edge
+        btn.Size = UDim2.new(1,0,0,38)
+        btn.BackgroundColor3 = bgCol or C.SURF2
+        btn.TextColor3 = C.TEXT
+        btn.Text = btnText
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 13
+        btn.AutoButtonColor = false
+        btn.BorderSizePixel = 0
+        btn.Active = true
+        btn.LayoutOrder = nextLO()
+        btn.Parent = scroll
+        corner(btn, 8)
+        stroke(btn)
         local icon = Instance.new("ImageLabel")
         icon.Size = UDim2.new(0,24,0,24)
         icon.Position = UDim2.new(0,8,0.5,-12)
@@ -1435,23 +2688,18 @@ do
         icon.ScaleType = Enum.ScaleType.Fit
         icon.ZIndex = btn.ZIndex + 1
         icon.Parent = btn
-
-        btn.MouseButton1Click:Connect(function()
-            pcall(callback)
-        end)
+        btn.MouseButton1Click:Connect(function() pcall(callback) end)
         return btn
     end
 
-    -- Discord button
     mkIconBtn("112538196670712", "  Join Discord", Color3.fromRGB(88, 101, 242), function()
         toclipboard("https://discord.gg/kVyWAJhTv4")
     end)
-
-    -- YouTube button
     mkIconBtn("8413527478", "  YouTube Channel", Color3.fromRGB(200, 40, 40), function()
         toclipboard("https://youtube.com/@dexploitz?si=IluugKbf4QInrmZs")
     end)
 end
+buildCredits()
 
 -- SIDE TOGGLE
 local sideBtn = Instance.new("Frame")
@@ -1474,6 +2722,9 @@ sideHit.MouseButton1Click:Connect(function() anchor.Visible = not anchor.Visible
 plr.CharacterAdded:Connect(function(c)
     character = c
     plot = workspace:FindFirstChild("Plot_" .. plr.Name)
+    -- Re-connect plot touches after respawn (plot might have changed)
+    task.wait(1)
+    connectPlotTouches()
 end)
 
-print("-- [PongHub v2] Loaded.")
+print("-- [PongHub v2] Loaded - made by pongwx23")
