@@ -1,0 +1,1323 @@
+-- ============================================================
+--  PONG HUB v2  |  The Strongest Battlegrounds
+--  ► LOADSTRING USAGE:
+--    _G.PH_ROLE         = "Farmer"
+--    _G.PH_ALTS         = {"Alt1","Alt2"}
+--    _G.PH_SPAWN        = Vector3.new(x,y,z)
+--    _G.PH_ATTACK       = "ordered"
+--    _G.PH_CUSTOM_COMBO = "4 m1, 1, dash"
+--    _G.PH_ORDERED_DASH = false
+--    _G.PH_AUTOSTART    = true
+--    loadstring(game:HttpGet("https://pastebin.com/raw/YOURCODE"))()
+-- ============================================================
+
+local REQUIRED_PLACE_ID = 10449761463
+if game.PlaceId ~= REQUIRED_PLACE_ID then
+	error("[PongHub v2] Wrong game. Required PlaceId: " .. REQUIRED_PLACE_ID)
+	return
+end
+
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local VirtualUser      = game:GetService("VirtualUser")
+local RunService       = game:GetService("RunService")
+
+local IsComputer = UserInputService.KeyboardEnabled
+local IsMobile   = not IsComputer and UserInputService.TouchEnabled
+local IsConsole  = (not IsComputer and not IsMobile) and UserInputService.GamepadEnabled
+
+local plr         = Players.LocalPlayer
+local character   = plr.Character or plr.CharacterAdded:Wait()
+local communicate = character:WaitForChild("Communicate")
+
+local function G(k, d) local v = _G[k]; return (v ~= nil) and v or d end
+
+local THREAT_RADIUS   = 80
+local WATCHDOG_TICK   = 3
+local ANTI_AFK_TICK   = 55
+local RECONNECT_WAIT  = 5
+local m1Delay         = 0.5
+local dashLength      = 1
+local stunDelay       = 0.4
+local trashReturnWait = 0.5
+local skillDelay      = {0.4, 0.4, 0.4, 0.4}  -- per-skill delays: skill1, skill2, skill3, skill4
+
+local BoardCFrame = CFrame.new(
+	231.665909, 447.859467, -5.73896503,
+	0.36434114, -0.00125046563, -0.931264758,
+	0, 0.999999166, -0.00134275947,
+	0.931265533, 0.000489222526, 0.364340812
+)
+
+local SafePlaces = {
+	{ label = "Map Corner 1",   pos = Vector3.new(-132,  440,  -355) },
+	{ label = "Map Corner 2",   pos = Vector3.new(-209,  440,   431) },
+	{ label = "Map Corner 3",   pos = Vector3.new( 369,  440,   440) },
+	{ label = "Map Corner 4",   pos = Vector3.new( 559,  440,  -374) },
+	{ label = "Death Counter",  pos = Vector3.new(-111,   29, 20324) },
+	{ label = "Baseplate",      pos = Vector3.new(1042,   20, 23008) },
+	{ label = "Atomic Ball",    pos = Vector3.new(1067,  132, 23008) },
+	{ label = "Custom (99999)", pos = Vector3.new(99999,99999, 99999) },
+}
+
+local State = {
+	Role           = G("PH_ROLE",         nil),
+	Running        = false,
+	AttackMode     = G("PH_ATTACK",       "ordered"),
+	AltTargets     = G("PH_ALTS",         {}),
+	RawAltTargets  = G("PH_ALTS",         {}),  -- raw list preserving "#all"
+	Whitelist      = {},
+	AltSpawnPlace  = G("PH_SPAWN",        SafePlaces[1].pos),
+	CustomCombo    = G("PH_CUSTOM_COMBO", ""),
+	OrderedDash    = G("PH_ORDERED_DASH", false),
+	UseAwakening   = false,
+	AutoStart      = G("PH_AUTOSTART",    false),
+	ThreatEnabled  = true,
+	FarmerThread   = nil,
+	AltThread      = nil,
+	AntiAFKThread  = nil,
+	WatchdogThread = nil,
+	ThreatThread   = nil,
+	LastFarmedIdx  = 1,
+	KillCount      = 0,
+	StartTime      = 0,
+	ThreatDetected = false,
+	CurrentFarmPos = nil,
+	LogLines       = {},
+	LogCB          = nil,
+	StatusCB       = nil,
+	ViewingBoard   = false,
+}
+_G.PH_SPAWN = State.AltSpawnPlace
+
+-- ── Logging & status ─────────────────────────────────────────
+local function log(msg, tag)
+	local line = "[" .. os.date("%H:%M:%S") .. "]" .. (tag and (" ["..tag.."]") or "") .. " " .. msg
+	table.insert(State.LogLines, 1, line)
+	if #State.LogLines > 80 then table.remove(State.LogLines) end
+	if State.LogCB then pcall(State.LogCB, line, tag) end
+	print("[PongHub] " .. msg)
+end
+
+local function uiStatus(text, col)
+	if State.StatusCB then pcall(State.StatusCB, text, col) end
+end
+
+local function sc(fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok then log("err: " .. tostring(err), "ERR") end
+	return ok
+end
+
+-- ── Combat inputs ─────────────────────────────────────────────
+local function m1()
+	local a1={Goal="LeftClick"}; local a2={Goal="LeftClickRelease"}
+	if IsMobile  then a1.Mobile=true;  a2.Mobile=true  end
+	if IsConsole then a1.Console=true; a2.Console=true end
+	sc(function() communicate:FireServer(a1) end)
+	sc(function() communicate:FireServer(a2) end)
+end
+
+local function skill(n)
+	local bp={}
+	for _,t in ipairs(plr.Backpack:GetChildren()) do if t:IsA("Tool") then table.insert(bp,t) end end
+	if not bp[n] then log("Skill "..n.." missing","WARN"); return end
+	sc(function() communicate:FireServer({Tool=bp[n],Goal="Console Move"}) end)
+end
+
+local function dash()
+	sc(function()
+		communicate:FireServer({Dash=Enum.KeyCode.W,Key=Enum.KeyCode.Q,Goal="KeyPress"})
+		communicate:FireServer({Dash=Enum.KeyCode.W,Key=Enum.KeyCode.Q,Goal="KeyRelease"})
+	end)
+end
+
+local function awakening()
+	sc(function()
+		communicate:FireServer({Goal="KeyPress",  Key=Enum.KeyCode.G})
+		communicate:FireServer({Goal="KeyRelease",Key=Enum.KeyCode.G})
+	end)
+end
+
+local function jump()
+	sc(function()
+		communicate:FireServer({Goal="KeyPress",  Key=Enum.KeyCode.Space})
+		communicate:FireServer({Goal="KeyRelease",Key=Enum.KeyCode.Space})
+	end)
+end
+
+-- ── Movement ─────────────────────────────────────────────────
+local function teleportTo(pos)
+	local chr=plr.Character
+	if chr then
+		local hrp=chr:FindFirstChild("HumanoidRootPart")
+		if hrp then hrp.CFrame=CFrame.new(pos) end
+	end
+end
+
+-- Teleport to myPos facing targetPos in all axes (lookAt)
+local function teleportFacing(myPos, targetPos)
+	local chr=plr.Character
+	if chr then
+		local hrp=chr:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			-- avoid NaN if positions are identical
+			if (myPos - targetPos).Magnitude > 0.01 then
+				hrp.CFrame = CFrame.lookAt(myPos, targetPos)
+			else
+				hrp.CFrame = CFrame.new(myPos)
+			end
+		end
+	end
+end
+
+local function teleportToCFrame(cf)
+	local chr=plr.Character
+	if chr then local hrp=chr:FindFirstChild("HumanoidRootPart"); if hrp then hrp.CFrame=cf end end
+end
+
+local function isAlive()
+	local chr=plr.Character; if not chr then return false end
+	local h=chr:FindFirstChildOfClass("Humanoid"); return h and h.Health>0
+end
+
+local function getHRP()
+	local chr=plr.Character; return chr and chr:FindFirstChild("HumanoidRootPart")
+end
+
+local function resetCharacter()
+	sc(function() plr.Character:FindFirstChildOfClass("Humanoid"):TakeDamage(math.huge) end)
+end
+
+local function refreshCommunicate()
+	if plr.Character then
+		local c=plr.Character:FindFirstChild("Communicate"); if c then communicate=c end
+	end
+end
+
+local function waitForChar(timeout)
+	timeout=timeout or 10; local t0=tick()
+	while not isAlive() do
+		if tick()-t0>timeout then log("waitForChar timeout","WARN"); return false end
+		task.wait(0.2)
+	end
+	task.wait(0.15); refreshCommunicate(); return true
+end
+
+local function createCustomPlace()
+	for _,v in ipairs(workspace:GetChildren()) do if v.Name=="_PHRoom" then v:Destroy() end end
+	local function mkPart(pos,size)
+		local p=Instance.new("Part",workspace)
+		p.Name="_PHRoom";p.Anchored=true;p.Position=pos;p.Size=size
+		p.Material=Enum.Material.Concrete;p.CastShadow=false;p.CanCollide=true
+	end
+	mkPart(Vector3.new(99999, 99990,99999),Vector3.new(100, 10,100))
+	mkPart(Vector3.new(99969,100020,99999),Vector3.new( 10,100,100))
+	mkPart(Vector3.new(100030,100020,99999),Vector3.new(10,100,100))
+	mkPart(Vector3.new(99999,100020,99969),Vector3.new(100,100, 10))
+	mkPart(Vector3.new(99999,100020,100030),Vector3.new(100,100,10))
+	mkPart(Vector3.new(99999,100050,99999),Vector3.new(100, 10,100))
+	log("Secret room built")
+end
+
+local function parseNameBox(text)
+	local raw = {}
+	for n in text:gmatch("[^\n]+") do
+		local t = n:match("^%s*(.-)%s*$")
+		if t ~= "" then table.insert(raw, t) end
+	end
+	return raw
+end
+
+-- Resolve #all at call time so newly joined players are included
+local function getResolvedTargets(rawList)
+	local out = {}
+	local hasAll = false
+	for _, name in ipairs(rawList) do
+		if name == "#all" then hasAll = true else table.insert(out, name) end
+	end
+	if hasAll then
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= plr then table.insert(out, p.Name) end
+		end
+	end
+	return out
+end
+
+-- Threat detection: strangers near pos, excluding alts and whitelist
+local function getStrangers(pos, radius)
+	local out = {}
+	-- Resolve whitelist (handles #all)
+	local resolvedWL = getResolvedTargets(State.Whitelist)
+	for _,p in ipairs(Players:GetPlayers()) do
+		if p == plr then continue end
+		local isAlt = false
+		local resolvedAlts = getResolvedTargets(State.AltTargets)
+		for _,name in ipairs(resolvedAlts) do
+			if p.Name == name then isAlt = true; break end
+		end
+		if isAlt then continue end
+		local isWL = false
+		for _,name in ipairs(resolvedWL) do
+			if p.Name == name then isWL = true; break end
+		end
+		if isWL then continue end
+		local chr = p.Character
+		if chr then
+			local hrp = chr:FindFirstChild("HumanoidRootPart")
+			if hrp and (hrp.Position - pos).Magnitude <= radius then
+				table.insert(out, p.Name)
+			end
+		end
+	end
+	return out
+end
+
+local function pickSafeSpot()
+	for _,place in ipairs(SafePlaces) do
+		if #getStrangers(place.pos, THREAT_RADIUS) == 0 then return place.pos, place.label end
+	end
+	return Vector3.new(99999,100000,99999), "Secret Room (fallback)"
+end
+
+-- ── Anti-AFK ─────────────────────────────────────────────────
+local function startAntiAFK()
+	if State.AntiAFKThread then task.cancel(State.AntiAFKThread) end
+	State.AntiAFKThread = task.spawn(function()
+		while true do
+			task.wait(ANTI_AFK_TICK)
+			sc(function() VirtualUser:CaptureController() end)
+			sc(function() VirtualUser:ClickButton2(Vector2.new(0,0)) end)
+			local cam = workspace.CurrentCamera
+			if cam then cam.CFrame = cam.CFrame * CFrame.Angles(0, 0.0005, 0) end
+			log("Anti-AFK ping","AFK")
+		end
+	end)
+end
+
+local function stopAntiAFK()
+	if State.AntiAFKThread then task.cancel(State.AntiAFKThread); State.AntiAFKThread = nil end
+end
+
+-- ── Watchdog ─────────────────────────────────────────────────
+local _lastBeat = 0
+local function beat() _lastBeat = tick() end
+
+local function startWatchdog(restartFn)
+	if State.WatchdogThread then task.cancel(State.WatchdogThread) end
+	_lastBeat = tick()
+	State.WatchdogThread = task.spawn(function()
+		while State.Running do
+			task.wait(WATCHDOG_TICK)
+			if tick() - _lastBeat > 30 then
+				log("Watchdog: loop frozen — restarting","WARN")
+				_lastBeat = tick(); sc(restartFn)
+			end
+		end
+	end)
+end
+
+local function stopWatchdog()
+	if State.WatchdogThread then task.cancel(State.WatchdogThread); State.WatchdogThread = nil end
+end
+
+-- ── Attack functions ──────────────────────────────────────────
+local function orderedAttack()
+	if State.UseAwakening then awakening(); task.wait(0.2) end
+	for s = 1, 4 do
+		if not State.Running then return end
+		for _ = 1, 4 do m1(); task.wait(m1Delay) end
+		if State.OrderedDash then dash(); task.wait(dashLength) end
+		skill(s); task.wait(skillDelay[s]); beat()
+	end
+end
+
+local function spamAttack()
+	if State.UseAwakening then awakening(); task.wait(0.15) end
+	for _ = 1, 4 do
+		m1(); task.wait(0.05); skill(1); task.wait(skillDelay[1])
+		m1(); task.wait(0.05); skill(2); task.wait(skillDelay[2])
+		m1(); task.wait(0.05); skill(3); task.wait(skillDelay[3])
+		m1(); task.wait(0.05); skill(4); task.wait(skillDelay[4])
+	end
+	beat()
+end
+
+local function customComboAttack(combo)
+	for tok in (combo..","):gmatch("([^,]+),") do
+		if not State.Running then break end
+		local t = tok:match("^%s*(.-)%s*$"):lower()
+		if     t == "dash" then dash(); task.wait(dashLength)
+		elseif t == "jump" then jump(); task.wait(0.2)
+		else
+			local cnt = t:match("(%d+)%s*m1")
+			if cnt then
+				for _ = 1, tonumber(cnt) do m1(); task.wait(m1Delay) end
+			else
+				local sn = t:match("^(%d+)$")
+				if sn then
+					local si = tonumber(sn)
+					skill(si); task.wait(skillDelay[si] or stunDelay)
+				end
+			end
+		end
+	end
+	beat()
+end
+
+local function hitResetAttack()
+	for _ = 1, 3 do m1(); task.wait(m1Delay) end
+	log("Hit x3 — waiting for alt self-reset...","FARM")
+	task.wait(1.8); skill(1); task.wait(skillDelay[1]); skill(2); task.wait(skillDelay[2]); beat()
+end
+
+local function trashcanAttack(altPos)
+	-- Find Workspace.Map.Trash, pick a random Trashcan model
+	local mapFolder = game:GetService("Workspace"):FindFirstChild("Map")
+	local trashFolder = mapFolder and mapFolder:FindFirstChild("Trash")
+	if not trashFolder then log("Workspace.Map.Trash not found","WARN"); return end
+
+	local cans = {}
+	for _, v in ipairs(trashFolder:GetChildren()) do
+		if v.Name == "Trashcan" then table.insert(cans, v) end
+	end
+	if #cans == 0 then log("No Trashcan models in Workspace.Map.Trash","WARN"); return end
+
+	-- Find a Trashcan whose "Trashcan" instance has Transparency == 0 (visible/active)
+	local pp = nil
+	local tries = {}
+	for _, can in ipairs(cans) do
+		local part = can:FindFirstChild("Trashcan")
+		if part and part:IsA("BasePart") and part.Transparency == 0 then
+			table.insert(tries, part)
+		end
+	end
+	if #tries == 0 then
+		-- Fallback: use any Trashcan part regardless of transparency
+		for _, can in ipairs(cans) do
+			local part = can:FindFirstChild("Trashcan") or can.PrimaryPart or can:FindFirstChildOfClass("BasePart")
+			if part then table.insert(tries, part) end
+		end
+	end
+	if #tries == 0 then log("No usable Trashcan part found","WARN"); return end
+	pp = tries[math.random(1, #tries)]
+
+	-- Stand 4 studs behind the trashcan (-Z), at standing height, facing it
+	local canPos   = pp.Position
+	local standPos = canPos + Vector3.new(0, 4, -4)
+
+	-- Teleport facing the trashcan → m1 → return to alt → m1 → wait
+	teleportFacing(standPos, canPos)
+	task.wait(0.1)
+	m1()
+	task.wait(m1Delay)
+	teleportFacing(altPos + Vector3.new(0, 4.5, 0), altPos)
+	task.wait(0.1)
+	m1()
+	task.wait(trashReturnWait)
+	beat()
+end
+
+local function runAttack(altPos)
+	local mode = State.AttackMode
+	if     mode == "ordered"   then orderedAttack()
+	elseif mode == "spam"      then spamAttack()
+	elseif mode == "custom"    then if State.CustomCombo ~= "" then customComboAttack(State.CustomCombo) end
+	elseif mode == "hit_reset" then hitResetAttack()
+	elseif mode == "trashcan"  then trashcanAttack(altPos)
+	end
+end
+
+-- ── Main loops ────────────────────────────────────────────────
+local startFarmerLoop, stopFarmerLoop
+local startAltLoop,    stopAltLoop
+
+startFarmerLoop = function()
+	if State.FarmerThread then task.cancel(State.FarmerThread) end
+	State.Running = true; State.StartTime = tick()
+	log("Farmer started. Targets: " .. table.concat(State.AltTargets, ", "))
+	uiStatus("FARMING", Color3.fromRGB(52, 211, 153))
+
+	if State.ThreatThread then task.cancel(State.ThreatThread) end
+	State.ThreatThread = task.spawn(function()
+		while State.Running do
+			task.wait(WATCHDOG_TICK)
+			if not State.ThreatEnabled then continue end
+			if State.CurrentFarmPos then
+				local s = getStrangers(State.CurrentFarmPos, THREAT_RADIUS)
+				if #s > 0 and not State.ThreatDetected then
+					log("Strangers near farm: " .. table.concat(s, ", "), "THREAT")
+					State.ThreatDetected = true
+					uiStatus("THREAT — relocating", Color3.fromRGB(251, 191, 36))
+				elseif #s == 0 and State.ThreatDetected then
+					log("Threat cleared","THREAT"); State.ThreatDetected = false
+				end
+			end
+		end
+	end)
+
+	State.FarmerThread = task.spawn(function()
+		while State.Running do
+			beat()
+			if State.ThreatDetected then
+				local newPos, newLabel = pickSafeSpot()
+				log("Relocating to: " .. newLabel, "THREAT")
+				State.AltSpawnPlace = newPos; State.CurrentFarmPos = newPos; _G.PH_SPAWN = newPos
+				State.ThreatDetected = false
+				uiStatus("Relocated → " .. newLabel, Color3.fromRGB(52, 211, 153))
+				task.wait(3); continue
+			end
+			if #State.AltTargets == 0 then log("No targets","WARN"); task.wait(2); continue end
+			local resolvedTargets = getResolvedTargets(State.AltTargets)
+			if #resolvedTargets == 0 then log("No targets resolved (#all may be empty)","WARN"); task.wait(2); continue end
+			local targetName = resolvedTargets[State.LastFarmedIdx % #resolvedTargets + 1]
+			State.LastFarmedIdx = (State.LastFarmedIdx % #resolvedTargets) + 1
+			local tp = Players:FindFirstChild(targetName)
+			if not tp then log("'" .. targetName .. "' not in server","WARN"); task.wait(1); continue end
+			local tc = tp.Character
+			if not tc then log(targetName .. " no character","WARN"); task.wait(2); continue end
+			local tHRP = tc:FindFirstChild("HumanoidRootPart")
+			if not tHRP then task.wait(0.5); continue end
+			if not waitForChar(8) then log("Waiting to respawn","WARN"); task.wait(RECONNECT_WAIT); continue end
+
+			local altPos = tHRP.Position; State.CurrentFarmPos = altPos
+			-- Rapid teleport, face the alt in all axes
+			local standPos = altPos + Vector3.new(0, 4.5, 0)
+			teleportFacing(standPos, altPos)
+			beat()
+			log("Attacking " .. targetName .. " [" .. State.AttackMode .. "]","FARM")
+			uiStatus("Attacking " .. targetName, Color3.fromRGB(99, 102, 241))
+			sc(function() runAttack(altPos) end); beat()
+
+			local altHum = tc:FindFirstChildOfClass("Humanoid")
+			if altHum and altHum.Health <= 0 then
+				State.KillCount += 1
+				log("Kill #" .. State.KillCount .. " on " .. targetName,"FARM")
+				uiStatus("Kill #" .. State.KillCount, Color3.fromRGB(52, 211, 153))
+			end
+		end
+		log("Farmer loop ended."); uiStatus("IDLE", Color3.fromRGB(120, 120, 160))
+	end)
+	startWatchdog(function() if State.Running then startFarmerLoop() end end)
+end
+
+stopFarmerLoop = function()
+	State.Running = false
+	for _, k in ipairs({"FarmerThread","ThreatThread","WatchdogThread"}) do
+		if State[k] then task.cancel(State[k]); State[k] = nil end
+	end
+	stopAntiAFK(); stopWatchdog()
+	log("Farmer stopped."); uiStatus("IDLE", Color3.fromRGB(120, 120, 160))
+end
+
+startAltLoop = function()
+	if State.AltThread then task.cancel(State.AltThread) end
+	State.Running = true; State.StartTime = tick()
+	log("Alt started. Spawn: " .. tostring(State.AltSpawnPlace))
+	uiStatus("ALT ACTIVE", Color3.fromRGB(139, 92, 246))
+	teleportTo(State.AltSpawnPlace)
+
+	plr.CharacterAdded:Connect(function(newChr)
+		if not State.Running then return end
+		newChr:WaitForChild("HumanoidRootPart", 5); task.wait(0.05)
+		if _G.PH_SPAWN then State.AltSpawnPlace = _G.PH_SPAWN end
+		teleportTo(State.AltSpawnPlace)
+		communicate = newChr:WaitForChild("Communicate", 5) or communicate
+		log("Respawned → teleported to spawn","ALT")
+	end)
+
+	State.AltThread = task.spawn(function()
+		while State.Running do
+			task.wait()   -- one-frame yield only, for maximum responsiveness
+			beat()
+			if _G.PH_SPAWN and _G.PH_SPAWN ~= State.AltSpawnPlace then
+				State.AltSpawnPlace = _G.PH_SPAWN
+				log("Spawn updated by farmer → moving","ALT")
+			end
+			local hrp = getHRP()
+			if hrp then
+				-- Rapid correction: teleport if more than 5 studs off spawn
+				if (hrp.Position - State.AltSpawnPlace).Magnitude > 5 then
+					teleportTo(State.AltSpawnPlace)
+				end
+				if State.AttackMode == "hit_reset" then
+					local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+					if hum and hum.Health > 0 and hum.Health < (hum.MaxHealth * 0.3) then
+						log("HP < 30% → self-resetting","ALT"); task.wait(0.08); resetCharacter()
+					end
+				end
+			end
+		end
+		log("Alt loop ended."); uiStatus("IDLE", Color3.fromRGB(120, 120, 160))
+	end)
+	startWatchdog(function() if State.Running then startAltLoop() end end)
+end
+
+stopAltLoop = function()
+	State.Running = false
+	for _, k in ipairs({"AltThread","WatchdogThread"}) do
+		if State[k] then task.cancel(State[k]); State[k] = nil end
+	end
+	stopAntiAFK(); stopWatchdog()
+	log("Alt stopped."); uiStatus("IDLE", Color3.fromRGB(120, 120, 160))
+end
+
+plr.CharacterAdded:Connect(function(c)
+	character = c; communicate = c:WaitForChild("Communicate", 5) or communicate
+end)
+
+task.defer(function()
+	if State.AutoStart and State.Role then
+		task.wait(2); log("Auto-starting: " .. State.Role)
+		if     State.Role == "Farmer" then startFarmerLoop()
+		elseif State.Role == "Alt"    then startAltLoop()
+		end
+	end
+end)
+
+-- ============================================================
+--  UI  —  CENTERED 4:3 DRAGGABLE WINDOW
+--
+--  DRAG LOGIC:
+--    On mouse-down on the title bar:
+--      1. Read frame.AbsolutePosition — this is always the TRUE
+--         top-left pixel of the rendered frame, regardless of
+--         AnchorPoint.
+--      2. Compute grabOffset = cursor - topLeft. This records
+--         WHICH PIXEL of the title bar you clicked.
+--      3. Switch AnchorPoint to (0,0) and set Position to the
+--         captured topLeft so the frame doesn't visually jump.
+--
+--    On mouse-move:
+--      newTopLeft = cursor - grabOffset
+--    → The pixel you grabbed stays exactly under your cursor.
+--    → The window does NOT snap to cursor center.
+-- ============================================================
+
+local _old = plr.PlayerGui:FindFirstChild("PongHubV2")
+if _old then _old:Destroy() end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name           = "PongHubV2"
+ScreenGui.ResetOnSpawn   = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.Parent         = plr.PlayerGui
+
+local C = {
+	bg      = Color3.fromRGB(  8,   8,  14),
+	surface = Color3.fromRGB( 16,  16,  26),
+	card    = Color3.fromRGB( 22,  22,  36),
+	cardH   = Color3.fromRGB( 28,  28,  46),
+	border  = Color3.fromRGB( 42,  42,  70),
+	accent  = Color3.fromRGB( 99, 102, 241),
+	hot     = Color3.fromRGB(139,  92, 246),
+	success = Color3.fromRGB( 52, 211, 153),
+	danger  = Color3.fromRGB(248, 113, 113),
+	warning = Color3.fromRGB(251, 191,  36),
+	text    = Color3.fromRGB(235, 235, 255),
+	muted   = Color3.fromRGB(120, 120, 160),
+	lWarn   = Color3.fromRGB(251, 191,  36),
+	lErr    = Color3.fromRGB(248, 113, 113),
+	lAlt    = Color3.fromRGB(139,  92, 246),
+	lAFK    = Color3.fromRGB( 52, 211, 153),
+	lFarm   = Color3.fromRGB( 99, 102, 241),
+}
+
+local FAST = TweenInfo.new(0.14, Enum.EasingStyle.Quad)
+local MED  = TweenInfo.new(0.24, Enum.EasingStyle.Quad)
+
+local function mk(cls, props, parent)
+	local i = Instance.new(cls)
+	for k, v in pairs(props) do i[k] = v end
+	if parent then i.Parent = parent end
+	return i
+end
+local function corner(p,r) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,r or 8); c.Parent=p end
+local function stroke(p,c,t) local s=Instance.new("UIStroke"); s.Color=c or C.border; s.Thickness=t or 1; s.Parent=p end
+local function tw(o,i,pr) TweenService:Create(o,i,pr):Play() end
+local function pad(p,l,r,t,b)
+	local u=Instance.new("UIPadding")
+	u.PaddingLeft=UDim.new(0,l or 0); u.PaddingRight=UDim.new(0,r or 0)
+	u.PaddingTop=UDim.new(0,t or 0);  u.PaddingBottom=UDim.new(0,b or 0); u.Parent=p
+end
+local function vlist(p,g)
+	local l=Instance.new("UIListLayout"); l.Padding=UDim.new(0,g or 6)
+	l.SortOrder=Enum.SortOrder.LayoutOrder; l.Parent=p; return l
+end
+local function hlist(p,g)
+	local l=Instance.new("UIListLayout"); l.FillDirection=Enum.FillDirection.Horizontal
+	l.Padding=UDim.new(0,g or 0); l.SortOrder=Enum.SortOrder.LayoutOrder; l.Parent=p; return l
+end
+
+-- ── Drag: grab-point preserving ───────────────────────────────
+-- MainFrame always has AnchorPoint (0,0) after the initial layout snap,
+-- so AbsolutePosition IS the top-left pixel. No AnchorPoint math needed.
+local function makeDraggable(frame, handle)
+	local dragging    = false
+	local grabOffsetX = 0
+	local grabOffsetY = 0
+
+	handle.InputBegan:Connect(function(inp)
+		if inp.UserInputType ~= Enum.UserInputType.MouseButton1 and
+		   inp.UserInputType ~= Enum.UserInputType.Touch then return end
+
+		-- AbsolutePosition is the true top-left pixel when AnchorPoint=(0,0)
+		local tlX = frame.AbsolutePosition.X
+		local tlY = frame.AbsolutePosition.Y
+
+		-- Record which pixel of the title bar was grabbed
+		grabOffsetX = inp.Position.X - tlX
+		grabOffsetY = inp.Position.Y - tlY
+		dragging    = true
+
+		inp.Changed:Connect(function()
+			if inp.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end)
+
+	UserInputService.InputChanged:Connect(function(inp)
+		if not dragging then return end
+		if inp.UserInputType ~= Enum.UserInputType.MouseMovement and
+		   inp.UserInputType ~= Enum.UserInputType.Touch then return end
+		local vp = workspace.CurrentCamera.ViewportSize
+		local sz = frame.AbsoluteSize
+		local nx = math.clamp(inp.Position.X - grabOffsetX, 0, vp.X - sz.X)
+		local ny = math.clamp(inp.Position.Y - grabOffsetY, 0, vp.Y - sz.Y)
+		frame.Position = UDim2.new(0, nx, 0, ny)
+	end)
+end
+
+-- ── Component helpers ─────────────────────────────────────────
+local function lbl(parent, text, size, col, bold, lo)
+	return mk("TextLabel", {
+		Text=text, TextSize=size or 11, TextColor3=col or C.text,
+		Font=bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+		BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left,
+		TextWrapped=true, Size=UDim2.new(1,0,0,0),
+		AutomaticSize=Enum.AutomaticSize.Y, LayoutOrder=lo or 0,
+	}, parent)
+end
+
+local function card(parent, lo)
+	local f=mk("Frame",{BackgroundColor3=C.card, Size=UDim2.new(1,0,0,0),
+		AutomaticSize=Enum.AutomaticSize.Y, LayoutOrder=lo or 0}, parent)
+	corner(f,7); stroke(f,C.border); vlist(f,5); pad(f,9,9,7,7); return f
+end
+
+local function section(parent, text, lo)
+	local f=mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,16),LayoutOrder=lo or 0}, parent)
+	lbl(f, text:upper(), 8, C.muted, true).Size = UDim2.new(1,0,1,0)
+	mk("Frame",{BackgroundColor3=C.border,Position=UDim2.new(0,0,1,-1),
+		Size=UDim2.new(1,0,0,1),BorderSizePixel=0}, f)
+	return f
+end
+
+local function bigBtn(parent, text, col, lo, tcol)
+	local b=mk("TextButton",{
+		Text=text, TextSize=11, TextColor3=tcol or C.text,
+		Font=Enum.Font.GothamBold, BackgroundColor3=col or C.accent,
+		Size=UDim2.new(1,0,0,32), AutoButtonColor=false, LayoutOrder=lo or 0,
+	}, parent); corner(b,6)
+	local base = col or C.accent
+	b.MouseEnter:Connect(function() tw(b,FAST,{BackgroundColor3=base:Lerp(Color3.new(1,1,1),0.1)}) end)
+	b.MouseLeave:Connect(function() tw(b,FAST,{BackgroundColor3=base}) end)
+	return b
+end
+
+local function inputBox(parent, ph, lo, multi, h)
+	local b=mk("TextBox",{
+		PlaceholderText=ph or "", Text="", TextSize=11,
+		TextColor3=C.text, PlaceholderColor3=C.muted, Font=Enum.Font.Gotham,
+		BackgroundColor3=C.surface, Size=UDim2.new(1,0,0,h or 28),
+		ClearTextOnFocus=false, MultiLine=multi or false,
+		TextXAlignment=Enum.TextXAlignment.Left,
+		TextYAlignment=multi and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center,
+		LayoutOrder=lo or 0, TextWrapped=true,
+	}, parent)
+	corner(b,5); stroke(b,C.border); pad(b,7,7,multi and 5 or 0)
+	b.Focused:Connect(function()   tw(b,FAST,{BackgroundColor3=C.cardH}) end)
+	b.FocusLost:Connect(function() tw(b,FAST,{BackgroundColor3=C.surface}) end)
+	return b
+end
+
+local function numRow(parent, labelText, getter, setter, lo)
+	local r=mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=lo or 0}, parent)
+	lbl(r, labelText, 10, C.muted).Size = UDim2.new(0.65,0,1,0)
+	local box=mk("TextBox",{Text=tostring(getter()),TextSize=10,TextColor3=C.text,
+		Font=Enum.Font.Gotham,BackgroundColor3=C.surface,
+		Size=UDim2.new(0,55,0,24),Position=UDim2.new(1,-57,0,1),
+		TextXAlignment=Enum.TextXAlignment.Center,ClearTextOnFocus=false}, r)
+	corner(box,5); stroke(box,C.border)
+	box:GetPropertyChangedSignal("Text"):Connect(function()
+		local v=tonumber(box.Text); if v and v >= 0 then setter(v) end
+	end)
+	box.Focused:Connect(function()   tw(box,FAST,{BackgroundColor3=C.cardH}) end)
+	box.FocusLost:Connect(function() tw(box,FAST,{BackgroundColor3=C.surface}) end)
+end
+
+local function scrollPage(parent)
+	local s=mk("ScrollingFrame",{
+		Size=UDim2.new(1,0,1,0), BackgroundTransparency=1, BorderSizePixel=0,
+		ScrollBarThickness=3, ScrollBarImageColor3=C.accent,
+		CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
+		Visible=false,
+	}, parent)
+	vlist(s,6); pad(s,9,9,7,9); return s
+end
+
+local function makeToggle(parent, offT, onT, init, cb, lo)
+	local state = init
+	local b=mk("TextButton",{
+		Text=state and onT or offT, TextSize=10, TextColor3=C.text,
+		Font=Enum.Font.GothamBold, BackgroundColor3=state and C.success or C.card,
+		Size=UDim2.new(0,50,0,24), AutoButtonColor=false, LayoutOrder=lo or 0,
+	}, parent); corner(b,5); stroke(b,C.border)
+	b.MouseButton1Click:Connect(function()
+		state = not state; b.Text = state and onT or offT
+		tw(b,FAST,{BackgroundColor3=state and C.success or C.card}); pcall(cb, state)
+	end)
+	return b, function() return state end
+end
+
+-- ============================================================
+--  MAIN WINDOW
+-- ============================================================
+local WIN_W_SCALE = 0.684
+
+-- Use scale-based centering expressed as offset after 1 frame so AbsoluteSize is known,
+-- then fix AnchorPoint to (0,0) permanently so drag math is always in pure pixel space.
+local MainFrame = mk("Frame", {
+	Name             = "MainFrame",
+	Size             = UDim2.new(WIN_W_SCALE, 0, WIN_W_SCALE, 0),
+	Position         = UDim2.new(0.5, 0, 0.5, 0),
+	AnchorPoint      = Vector2.new(0.5, 0.5),
+	BackgroundColor3 = C.bg,
+	BorderSizePixel  = 0,
+	ClipsDescendants = true,
+}, ScreenGui)
+corner(MainFrame, 10); stroke(MainFrame, C.border)
+-- After first layout pass, snap to pixel offsets with AnchorPoint (0,0)
+task.defer(function()
+	local vp = workspace.CurrentCamera.ViewportSize
+	local sz = MainFrame.AbsoluteSize
+	local tlX = math.floor((vp.X - sz.X) / 2)
+	local tlY = math.floor((vp.Y - sz.Y) / 2)
+	MainFrame.AnchorPoint = Vector2.new(0, 0)
+	MainFrame.Position    = UDim2.new(0, tlX, 0, tlY)
+end)
+
+do
+	local arc = Instance.new("UIAspectRatioConstraint")
+	arc.AspectRatio  = 4 / 3
+	arc.AspectType   = Enum.AspectType.FitWithinMaxSize
+	arc.DominantAxis = Enum.DominantAxis.Width
+	arc.Parent       = MainFrame
+end
+
+mk("UIGradient", {
+	Rotation = 130,
+	Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(15,11,32)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(8,8,14)),
+	}),
+}, MainFrame)
+
+-- Title bar
+local TitleBar = mk("Frame", {
+	Size=UDim2.new(1,0,0,44), BackgroundColor3=C.surface,
+	BorderSizePixel=0, ZIndex=10,
+}, MainFrame); corner(TitleBar, 10)
+mk("Frame",{Size=UDim2.new(1,0,0,10),Position=UDim2.new(0,0,1,-10),
+	BackgroundColor3=C.surface,BorderSizePixel=0,ZIndex=9}, TitleBar)
+mk("Frame",{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),
+	BackgroundColor3=C.border,BorderSizePixel=0,ZIndex=10}, TitleBar)
+
+mk("TextLabel",{Text="⚡",TextSize=18,Font=Enum.Font.GothamBold,
+	BackgroundTransparency=1,TextColor3=C.accent,
+	Position=UDim2.new(0,9,0.5,-10),Size=UDim2.new(0,22,0,20),ZIndex=11}, TitleBar)
+mk("TextLabel",{Text="PONG HUB",TextSize=13,Font=Enum.Font.GothamBold,
+	BackgroundTransparency=1,TextColor3=C.text,
+	Position=UDim2.new(0,34,0,7),Size=UDim2.new(0,120,0,16),
+	TextXAlignment=Enum.TextXAlignment.Left,ZIndex=11}, TitleBar)
+mk("TextLabel",{Text="v2 · TSB",TextSize=9,Font=Enum.Font.Gotham,
+	BackgroundTransparency=1,TextColor3=C.muted,
+	Position=UDim2.new(0,34,0,24),Size=UDim2.new(0,80,0,12),
+	TextXAlignment=Enum.TextXAlignment.Left,ZIndex=11}, TitleBar)
+
+local statusDot = mk("Frame",{Size=UDim2.new(0,7,0,7),BackgroundColor3=C.muted,
+	ZIndex=11,Position=UDim2.new(1,-76,0.5,-3)}, TitleBar); corner(statusDot,4)
+local statusLbl = mk("TextLabel",{Text="IDLE",TextSize=9,Font=Enum.Font.GothamBold,
+	BackgroundTransparency=1,TextColor3=C.muted,
+	Position=UDim2.new(1,-68,0.5,-7),Size=UDim2.new(0,52,0,14),
+	TextXAlignment=Enum.TextXAlignment.Left,ZIndex=11}, TitleBar)
+local killLbl = mk("TextLabel",{Text="0 kills",TextSize=9,Font=Enum.Font.GothamBold,
+	BackgroundTransparency=1,TextColor3=C.accent,
+	Position=UDim2.new(1,-140,0.5,-7),Size=UDim2.new(0,62,0,14),
+	TextXAlignment=Enum.TextXAlignment.Left,ZIndex=11}, TitleBar)
+
+State.StatusCB = function(text, col)
+	statusLbl.Text = text; statusLbl.TextColor3 = col or C.muted
+	tw(statusDot, FAST, {BackgroundColor3=col or C.muted})
+	killLbl.Text = State.KillCount .. " kills"
+end
+
+local minimized = false
+local minBtn = mk("TextButton",{
+	Text="—", TextSize=15, TextColor3=C.muted, Font=Enum.Font.GothamBold,
+	BackgroundColor3=C.surface, Size=UDim2.new(0,36,0,36),
+	Position=UDim2.new(1,-40,0.5,-18), AutoButtonColor=false, ZIndex=12,
+}, TitleBar); corner(minBtn,6); stroke(minBtn,C.border)
+
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	if minimized then
+		tw(MainFrame, MED, {Size=UDim2.new(WIN_W_SCALE, 0, 0, 44)})
+	else
+		tw(MainFrame, MED, {Size=UDim2.new(WIN_W_SCALE, 0, WIN_W_SCALE, 0)})
+	end
+	minBtn.Text = minimized and "□" or "—"
+end)
+
+makeDraggable(MainFrame, TitleBar)
+
+-- Tab bar
+local TabBar = mk("Frame",{
+	Size=UDim2.new(1,0,0,34), Position=UDim2.new(0,0,0,44),
+	BackgroundColor3=C.surface, BorderSizePixel=0, ZIndex=8,
+}, MainFrame)
+mk("Frame",{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),
+	BackgroundColor3=C.border,BorderSizePixel=0,ZIndex=9}, TabBar)
+hlist(TabBar, 0)
+
+local ContentArea = mk("Frame",{
+	Size=UDim2.new(1,0,1,-78), Position=UDim2.new(0,0,0,78),
+	BackgroundTransparency=1, ClipsDescendants=true,
+}, MainFrame)
+
+local TABS = {
+	{id="role",     icon="👤 Role"},
+	{id="farm",     icon="⚔ Farm"},
+	{id="teleport", icon="🌀 TP"},
+	{id="altsetup", icon="🤖 Alt"},
+	{id="settings", icon="⚙ Set"},
+	{id="log",      icon="📋 Log"},
+}
+
+local tabBtns = {}; local tabPages = {}; local activeTab = nil
+
+local function switchTab(id)
+	if activeTab == id then return end; activeTab = id
+	for _, def in ipairs(TABS) do
+		local b = tabBtns[def.id]; local p = tabPages[def.id]; local on = def.id == id
+		tw(b, FAST, {BackgroundColor3=on and C.accent or C.surface, TextColor3=on and C.text or C.muted})
+		if p then p.Visible = on end
+	end
+end
+
+for _, def in ipairs(TABS) do
+	local b = mk("TextButton",{
+		Text=def.icon, TextSize=9, TextColor3=C.muted,
+		Font=Enum.Font.GothamBold, BackgroundColor3=C.surface,
+		Size=UDim2.new(1/#TABS, 0, 1, 0), AutoButtonColor=false, ZIndex=9,
+	}, TabBar); tabBtns[def.id] = b
+	local p = scrollPage(ContentArea); tabPages[def.id] = p
+	b.MouseButton1Click:Connect(function() switchTab(def.id) end)
+end
+
+-- ============================================================
+--  TAB: ROLE
+-- ============================================================
+do
+	local p = tabPages["role"]
+	local c1 = card(p,1); section(c1,"Select Role",0)
+	local roleLbl = lbl(c1,"No role selected.",10,C.muted,false,1)
+	local fBtn = bigBtn(c1,"⚔  FARMER",C.accent,2); fBtn.Size=UDim2.new(1,0,0,40); fBtn.TextSize=12
+	local aBtn = bigBtn(c1,"🤖  ALT",C.card,3); aBtn.Size=UDim2.new(1,0,0,40); aBtn.TextSize=12; stroke(aBtn,C.border)
+
+	local function refreshRole()
+		tw(fBtn, MED, {BackgroundColor3=State.Role=="Farmer" and C.accent or C.card})
+		tw(aBtn, MED, {BackgroundColor3=State.Role=="Alt"    and C.hot   or C.card})
+		roleLbl.Text = State.Role and ("Role: "..State.Role.." — configure in the matching tab.") or "No role selected."
+		roleLbl.TextColor3 = State.Role=="Farmer" and C.accent or State.Role=="Alt" and C.hot or C.muted
+	end
+
+	fBtn.MouseButton1Click:Connect(function()
+		stopFarmerLoop(); stopAltLoop(); State.Role="Farmer"; refreshRole(); switchTab("farm")
+	end)
+	aBtn.MouseButton1Click:Connect(function()
+		stopFarmerLoop(); stopAltLoop(); State.Role="Alt"; refreshRole(); switchTab("altsetup")
+	end)
+	refreshRole()
+
+	local c2 = card(p,2); section(c2,"Pastebin / loadstring template",0)
+	mk("TextLabel",{
+		Text='_G.PH_ROLE="Farmer"\n_G.PH_ALTS={"Alt1","Alt2"}\n_G.PH_ATTACK="ordered"\n_G.PH_AUTOSTART=true\nloadstring(game:HttpGet("RAW_PASTE_URL"))()',
+		TextSize=8,TextColor3=C.success,Font=Enum.Font.Code,
+		BackgroundColor3=C.surface,Size=UDim2.new(1,0,0,62),
+		TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
+		TextWrapped=true,LayoutOrder=1,
+	}, c2); corner(c2:FindFirstChildOfClass("TextLabel"),4)
+	pad(c2:FindFirstChildOfClass("TextLabel"),6,6,4,4)
+end
+
+-- ============================================================
+--  TAB: FARM
+-- ============================================================
+do
+	local p = tabPages["farm"]
+
+	-- Alt targets
+	local c1 = card(p,1); section(c1,'Alt Targets  (one per line · "#all" = everyone)',0)
+	local tbox = inputBox(c1,"Alt1\nAlt2\n#all",1,true,56)
+	if #State.AltTargets > 0 then tbox.Text = table.concat(State.AltTargets,"\n") end
+	tbox:GetPropertyChangedSignal("Text"):Connect(function()
+		State.AltTargets = parseNameBox(tbox.Text)
+	end)
+	local c2 = card(p,2); section(c2,"Attack Mode",0)
+	local modeData = {
+		{id="ordered",   lbl="Ordered"},
+		{id="spam",      lbl="Spam"},
+		{id="custom",    lbl="Custom"},
+		{id="hit_reset", lbl="Hit+Reset"},
+		{id="trashcan",  lbl="TrashCan"},
+	}
+	local mCon = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,0),
+		AutomaticSize=Enum.AutomaticSize.Y,LayoutOrder=1}, c2)
+	local mg = Instance.new("UIGridLayout")
+	mg.CellSize=UDim2.new(0.5,-3,0,26); mg.CellPadding=UDim2.new(0,5,0,4)
+	mg.SortOrder=Enum.SortOrder.LayoutOrder; mg.Parent=mCon
+	local modeBtns = {}
+	local function selMode(id)
+		State.AttackMode = id
+		for mid, b in pairs(modeBtns) do
+			tw(b, FAST, {BackgroundColor3=mid==id and C.accent or C.card})
+		end
+	end
+	for i, m in ipairs(modeData) do
+		local b = mk("TextButton",{Text=m.lbl,TextSize=10,TextColor3=C.text,
+			Font=Enum.Font.GothamBold,
+			BackgroundColor3=m.id==State.AttackMode and C.accent or C.card,
+			AutoButtonColor=false,LayoutOrder=i}, mCon)
+		corner(b,5); stroke(b,C.border); modeBtns[m.id]=b
+		b.MouseButton1Click:Connect(function() selMode(m.id) end)
+	end
+
+	-- Mode toggles
+	local dRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=2}, c2)
+	lbl(dRow,"Dashes in Ordered mode",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local dTog = makeToggle(dRow,"OFF","ON",State.OrderedDash,function(v) State.OrderedDash=v end)
+	dTog.Position=UDim2.new(1,-52,0,1)
+
+	local awRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=3}, c2)
+	lbl(awRow,"Spam G (Awakening) — Ordered & Spam",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local awTog = makeToggle(awRow,"OFF","ON",State.UseAwakening,function(v) State.UseAwakening=v end)
+	awTog.Position=UDim2.new(1,-52,0,1)
+
+	-- Attack delays
+	local c3 = card(p,3); section(c3,"Attack Delays",0)
+	numRow(c3,"M1 delay (s):",        function() return m1Delay        end, function(v) m1Delay=v         end, 1)
+	numRow(c3,"Dash length (s):",     function() return dashLength      end, function(v) dashLength=v       end, 2)
+	numRow(c3,"Stun delay (s):",      function() return stunDelay       end, function(v) stunDelay=v        end, 3)
+	numRow(c3,"Trash return wait(s):",function() return trashReturnWait end,function(v) trashReturnWait=v   end, 4)
+	numRow(c3,"Skill 1 delay (s):",   function() return skillDelay[1]   end, function(v) skillDelay[1]=v   end, 5)
+	numRow(c3,"Skill 2 delay (s):",   function() return skillDelay[2]   end, function(v) skillDelay[2]=v   end, 6)
+	numRow(c3,"Skill 3 delay (s):",   function() return skillDelay[3]   end, function(v) skillDelay[3]=v   end, 7)
+	numRow(c3,"Skill 4 delay (s):",   function() return skillDelay[4]   end, function(v) skillDelay[4]=v   end, 8)
+
+	-- Custom combo
+	local c4 = card(p,4); section(c4,"Custom Combo",0)
+	lbl(c4,'e.g. "4 m1, 1, dash, 3 m1, 2, jump"',9,C.muted,false,1)
+	local cBox = inputBox(c4,"4 m1, 1, dash, 3 m1, 2, jump, 4 m1",2,false,28)
+	cBox.Text = State.CustomCombo
+	cBox:GetPropertyChangedSignal("Text"):Connect(function() State.CustomCombo=cBox.Text end)
+
+	-- Controls
+	local c5 = card(p,5); section(c5,"Controls",0)
+	local boardOn=false; local boardThread=nil
+	local bBtn = bigBtn(c5,"👁  Leaderboard: OFF",C.surface,1,C.muted); stroke(bBtn,C.border)
+	bBtn.MouseButton1Click:Connect(function()
+		boardOn = not boardOn; State.ViewingBoard = boardOn
+		if boardOn then
+			bBtn.Text="👁  Leaderboard: ON"
+			tw(bBtn,FAST,{BackgroundColor3=C.accent}); bBtn.TextColor3=C.text
+			boardThread = task.spawn(function()
+				local cam=workspace.CurrentCamera
+				while State.ViewingBoard do
+					cam.CameraType=Enum.CameraType.Scriptable
+					cam.CFrame=BoardCFrame
+					task.wait(0.05)
+				end
+			end)
+		else
+			bBtn.Text="👁  Leaderboard: OFF"
+			tw(bBtn,FAST,{BackgroundColor3=C.surface}); bBtn.TextColor3=C.muted
+			State.ViewingBoard=false
+			if boardThread then task.cancel(boardThread); boardThread=nil end
+			workspace.CurrentCamera.CameraType=Enum.CameraType.Custom
+		end
+	end)
+
+	local startBtn = bigBtn(c5,"▶  START FARMING",C.success,2)
+	startBtn.Size=UDim2.new(1,0,0,38); startBtn.TextSize=13
+	startBtn.MouseButton1Click:Connect(function()
+		if State.Role ~= "Farmer" then
+			startBtn.Text="⚠ Set role to Farmer first!"
+			task.delay(2,function() startBtn.Text="▶  START FARMING" end); return
+		end
+		if State.Running then
+			stopFarmerLoop(); startBtn.Text="▶  START FARMING"
+			tw(startBtn,MED,{BackgroundColor3=C.success})
+		else
+			startFarmerLoop(); startBtn.Text="⏹  STOP FARMING"
+			tw(startBtn,MED,{BackgroundColor3=C.danger})
+		end
+	end)
+
+	local resetRoleFarmBtn = bigBtn(c5,"🔄  Reset Role",C.surface,3,C.muted); stroke(resetRoleFarmBtn,C.border)
+	resetRoleFarmBtn.MouseButton1Click:Connect(function()
+		stopFarmerLoop(); stopAltLoop(); State.Role=nil; switchTab("role")
+		resetRoleFarmBtn.Text="✅ Role cleared"
+		task.delay(2, function() resetRoleFarmBtn.Text="🔄  Reset Role" end)
+	end)
+end
+
+-- ============================================================
+--  TAB: TELEPORT  (works for Farmer AND Alt)
+-- ============================================================
+do
+	local p = tabPages["teleport"]
+
+	local c1 = card(p,1); section(c1,"Quick Teleport",0)
+	for i, place in ipairs(SafePlaces) do
+		local b = bigBtn(c1,place.label,C.surface,i,C.text); stroke(b,C.border)
+		b.Size=UDim2.new(1,0,0,28); b.TextSize=10
+		b.MouseButton1Click:Connect(function() teleportTo(place.pos) end)
+	end
+
+	local c2 = card(p,2); section(c2,'Teleport to Player  ("#all" cycles alts)',0)
+	local pBox = inputBox(c2,"PlayerName",1,false,28)
+	local pBtn = bigBtn(c2,"Teleport to Player",C.accent,2)
+	pBtn.MouseButton1Click:Connect(function()
+		local name = pBox.Text:match("^%s*(.-)%s*$")
+		-- #all: teleport to first alt target found
+		if name == "#all" then
+			local resolved = getResolvedTargets(State.AltTargets)
+			if #resolved > 0 then name = resolved[1] end
+		end
+		local tp = Players:FindFirstChild(name)
+		if tp and tp.Character then
+			local hrp = tp.Character:FindFirstChild("HumanoidRootPart")
+			if hrp then teleportTo(hrp.Position + Vector3.new(0,4,0)); return end
+		end
+		pBtn.Text="⚠ Player not found"
+		task.delay(2,function() pBtn.Text="Teleport to Player" end)
+	end)
+
+	local c3 = card(p,3); section(c3,"Custom XYZ",0)
+	local xb=inputBox(c3,"X",1); local yb=inputBox(c3,"Y",2); local zb=inputBox(c3,"Z",3)
+	bigBtn(c3,"Teleport to XYZ",C.accent,4).MouseButton1Click:Connect(function()
+		local x,y,z=tonumber(xb.Text),tonumber(yb.Text),tonumber(zb.Text)
+		if x and y and z then teleportTo(Vector3.new(x,y,z)) end
+	end)
+
+	local c4 = card(p,4); section(c4,"Leaderboard Camera",0)
+	local boardOn2=false; local boardThread2=nil
+	local lbBtn = bigBtn(c4,"👁  Leaderboard: OFF",C.surface,1,C.muted); stroke(lbBtn,C.border)
+	lbBtn.MouseButton1Click:Connect(function()
+		boardOn2 = not boardOn2
+		if boardOn2 then
+			lbBtn.Text="👁  Leaderboard: ON"
+			tw(lbBtn,FAST,{BackgroundColor3=C.accent}); lbBtn.TextColor3=C.text
+			boardThread2 = task.spawn(function()
+				local cam=workspace.CurrentCamera
+				while boardOn2 do
+					cam.CameraType=Enum.CameraType.Scriptable
+					cam.CFrame=BoardCFrame
+					task.wait(0.05)
+				end
+			end)
+		else
+			lbBtn.Text="👁  Leaderboard: OFF"
+			tw(lbBtn,FAST,{BackgroundColor3=C.surface}); lbBtn.TextColor3=C.muted
+			if boardThread2 then task.cancel(boardThread2); boardThread2=nil end
+			workspace.CurrentCamera.CameraType=Enum.CameraType.Custom
+		end
+	end)
+end
+
+-- ============================================================
+--  TAB: ALT SETUP
+-- ============================================================
+do
+	local p = tabPages["altsetup"]
+
+	local c1 = card(p,1); section(c1,"Spawn Location",0)
+	local selLbl = lbl(c1,"Selected: "..SafePlaces[1].label,10,C.accent,true,1)
+	for i, place in ipairs(SafePlaces) do
+		local b = bigBtn(c1,place.label,C.surface,i+1,C.text); stroke(b,C.border)
+		b.Size=UDim2.new(1,0,0,28); b.TextSize=10
+		b.MouseButton1Click:Connect(function()
+			State.AltSpawnPlace=place.pos; _G.PH_SPAWN=place.pos
+			selLbl.Text="Selected: "..place.label
+		end)
+	end
+
+	local c2 = card(p,2); section(c2,"Custom Spawn Position",0)
+	local axb=inputBox(c2,"X",1); local ayb=inputBox(c2,"Y",2); local azb=inputBox(c2,"Z",3)
+	if State.AltSpawnPlace then
+		axb.Text=tostring(math.round(State.AltSpawnPlace.X))
+		ayb.Text=tostring(math.round(State.AltSpawnPlace.Y))
+		azb.Text=tostring(math.round(State.AltSpawnPlace.Z))
+	end
+	bigBtn(c2,"Set Custom Spawn",C.accent,4).MouseButton1Click:Connect(function()
+		local x,y,z=tonumber(axb.Text),tonumber(ayb.Text),tonumber(azb.Text)
+		if x and y and z then
+			State.AltSpawnPlace=Vector3.new(x,y,z); _G.PH_SPAWN=State.AltSpawnPlace
+			selLbl.Text="Selected: Custom ("..x..","..y..","..z..")"
+		end
+	end)
+	local buildBtn = bigBtn(c2,"Build Secret Room (99999)",C.surface,5,C.text)
+	stroke(buildBtn,C.border); buildBtn.TextSize=10
+	buildBtn.MouseButton1Click:Connect(function()
+		createCustomPlace(); State.AltSpawnPlace=Vector3.new(99999,100000,99999)
+		_G.PH_SPAWN=State.AltSpawnPlace; selLbl.Text="Selected: Secret Room"
+		buildBtn.Text="✅ Room Built!"
+		task.delay(3,function() buildBtn.Text="Build Secret Room (99999)" end)
+	end)
+
+	-- Farmer usernames (alt's whitelist: won't treat these as threats)
+	local c3 = card(p,3); section(c3,'Farmer Usernames  ("#all" = everyone)',0)
+	lbl(c3,"Alt won't treat these players as threats",9,C.muted,false,1)
+	local farmerBox = inputBox(c3,"FarmerName\n#all",2,true,44)
+	farmerBox:GetPropertyChangedSignal("Text"):Connect(function()
+		State.Whitelist = parseNameBox(farmerBox.Text)
+	end)
+
+	local c4 = card(p,4); section(c4,"Alt Controls",0)
+	local sAltBtn = bigBtn(c4,"▶  START ALT MODE",C.hot,1)
+	sAltBtn.Size=UDim2.new(1,0,0,38); sAltBtn.TextSize=13
+	sAltBtn.MouseButton1Click:Connect(function()
+		if State.Role ~= "Alt" then
+			sAltBtn.Text="⚠ Set role to Alt first!"
+			task.delay(2,function() sAltBtn.Text="▶  START ALT MODE" end); return
+		end
+		if State.Running then
+			stopAltLoop(); sAltBtn.Text="▶  START ALT MODE"
+			tw(sAltBtn,MED,{BackgroundColor3=C.hot})
+		else
+			startAltLoop(); sAltBtn.Text="⏹  STOP ALT MODE"
+			tw(sAltBtn,MED,{BackgroundColor3=C.danger})
+		end
+	end)
+	local rBtn2 = bigBtn(c4,"Manually Reset Character",C.surface,2,C.danger); stroke(rBtn2,C.danger)
+	rBtn2.MouseButton1Click:Connect(function() resetCharacter() end)
+	local tBtn = bigBtn(c4,"Teleport to Spawn Now",C.surface,3,C.text); stroke(tBtn,C.border)
+	tBtn.MouseButton1Click:Connect(function() teleportTo(State.AltSpawnPlace) end)
+
+	local resetRoleAltBtn = bigBtn(c4,"🔄  Reset Role",C.surface,4,C.muted); stroke(resetRoleAltBtn,C.border)
+	resetRoleAltBtn.MouseButton1Click:Connect(function()
+		stopFarmerLoop(); stopAltLoop(); State.Role=nil; switchTab("role")
+		resetRoleAltBtn.Text="✅ Role cleared"
+		task.delay(2, function() resetRoleAltBtn.Text="🔄  Reset Role" end)
+	end)
+end
+
+-- ============================================================
+--  TAB: SETTINGS
+-- ============================================================
+do
+	local p = tabPages["settings"]
+
+	local c1 = card(p,1); section(c1,"Anti-AFK",0)
+	local afkRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=1}, c1)
+	lbl(afkRow,"Anti-AFK (VirtualUser + camera nudge)",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local afkTog = makeToggle(afkRow,"OFF","ON",true,function(v)
+		if v then startAntiAFK() else stopAntiAFK() end
+	end); afkTog.Position=UDim2.new(1,-52,0,1)
+	numRow(c1,"Anti-AFK tick (s):",function() return ANTI_AFK_TICK end,function(v) ANTI_AFK_TICK=v end,2)
+
+	local c2 = card(p,2); section(c2,"Threat Detection",0)
+	local thrRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=1}, c2)
+	lbl(thrRow,"Auto-relocate on stranger approach",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local thrTog = makeToggle(thrRow,"OFF","ON",true,function(v) State.ThreatEnabled=v end)
+	thrTog.Position=UDim2.new(1,-52,0,1)
+	numRow(c2,"Threat radius (studs):",function() return THREAT_RADIUS end,function(v) THREAT_RADIUS=v end,2)
+
+	-- Farmer-side whitelist
+	local c3 = card(p,3); section(c3,'Threat Whitelist  ("#all" = everyone)',0)
+	lbl(c3,"These players won't trigger relocation",9,C.muted,false,1)
+	local wlBox = inputBox(c3,"FriendName\n#all",2,true,56)
+	wlBox:GetPropertyChangedSignal("Text"):Connect(function()
+		State.Whitelist = parseNameBox(wlBox.Text)
+	end)
+
+	local c4 = card(p,4); section(c4,"Watchdog",0)
+	lbl(c4,"Auto-restarts frozen loops every 30s. Always active while running.",10,C.muted,false,1)
+end
+
+-- ============================================================
+--  TAB: LOG
+-- ============================================================
+do
+	local p = tabPages["log"]
+	local c1 = card(p,1); section(c1,"Live Log",0)
+	local logScroll = mk("ScrollingFrame",{
+		Size=UDim2.new(1,0,0,260),BackgroundColor3=C.surface,BorderSizePixel=0,
+		ScrollBarThickness=3,ScrollBarImageColor3=C.accent,
+		CanvasSize=UDim2.new(0,0,0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,
+		LayoutOrder=1,
+	}, c1); corner(logScroll,5); pad(logScroll,5,5,4,4); vlist(logScroll,2)
+
+	local logLabels = {}
+	local tagCols = {WARN=C.lWarn,ERR=C.lErr,THREAT=C.lErr,ALT=C.lAlt,AFK=C.lAFK,FARM=C.lFarm}
+	local function addLogLine(text, tag)
+		local col = tagCols[tag] or C.muted
+		local ll = mk("TextLabel",{
+			Text=text,TextSize=8,TextColor3=col,Font=Enum.Font.Code,
+			BackgroundTransparency=1,Size=UDim2.new(1,0,0,0),
+			AutomaticSize=Enum.AutomaticSize.Y,
+			TextXAlignment=Enum.TextXAlignment.Left,TextWrapped=true,
+		}, logScroll)
+		table.insert(logLabels,1,ll)
+		if #logLabels > 50 then logLabels[#logLabels]:Destroy(); table.remove(logLabels) end
+		for i, ll_ in ipairs(logLabels) do ll_.LayoutOrder=i end
+	end
+	State.LogCB = function(text,tag) task.defer(function() pcall(addLogLine,text,tag) end) end
+	for _, line in ipairs(State.LogLines) do addLogLine(line,nil) end
+
+	local c2 = card(p,2); section(c2,"Stats",0)
+	local statsLbl = mk("TextLabel",{
+		Text="—",TextSize=9,TextColor3=C.text,Font=Enum.Font.Gotham,
+		BackgroundTransparency=1,Size=UDim2.new(1,0,0,0),
+		AutomaticSize=Enum.AutomaticSize.Y,
+		TextXAlignment=Enum.TextXAlignment.Left,LayoutOrder=1,TextWrapped=true,
+	}, c2)
+	task.spawn(function()
+		while true do
+			task.wait(1)
+			local up = State.StartTime > 0 and math.floor(tick()-State.StartTime) or 0
+			statsLbl.Text = string.format("Role: %s | Kills: %d | Uptime: %dm%ds | Mode: %s",
+				State.Role or "None", State.KillCount, math.floor(up/60), up%60, State.AttackMode)
+			killLbl.Text = State.KillCount .. " kills"
+		end
+	end)
+	local clrBtn = bigBtn(c2,"Clear Log",C.surface,2,C.muted); stroke(clrBtn,C.border); clrBtn.TextSize=10
+	clrBtn.MouseButton1Click:Connect(function()
+		State.LogLines = {}
+		for _, l in ipairs(logLabels) do l:Destroy() end; table.clear(logLabels)
+	end)
+end
+
+-- ============================================================
+--  BOOT
+-- ============================================================
+switchTab("role")
+task.spawn(function()
+	task.wait(3); startAntiAFK()
+	log("PongHub v2 ready. Anti-AFK active.")
+	if State.Role then log("_G role pre-set: "..State.Role) end
+end)
