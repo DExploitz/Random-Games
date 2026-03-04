@@ -8,7 +8,7 @@
 --    _G.PH_CUSTOM_COMBO = "4 m1, 1, dash"
 --    _G.PH_ORDERED_DASH = false
 --    _G.PH_AUTOSTART    = true
---    loadstring(game:HttpGet("https://pastebin.com/raw/YOURCODE"))()
+--    loadstring(game:HttpGet("https://raw.githubusercontent.com/DExploitz/Random-Games/refs/heads/main/PongHubTSB"))()
 -- ============================================================
 
 local REQUIRED_PLACE_ID = 10449761463
