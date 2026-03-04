@@ -79,7 +79,6 @@ local State = {
 	AntiAFKThread  = nil,
 	WatchdogThread = nil,
 	ThreatThread   = nil,
-	LastFarmedIdx  = 1,
 	KillCount      = 0,
 	StartTime      = 0,
 	ThreatDetected = false,
@@ -88,6 +87,21 @@ local State = {
 	LogCB          = nil,
 	StatusCB       = nil,
 	ViewingBoard   = false,
+	-- Alt: hit+reset mode
+	AltHitReset    = false,
+	-- Alt: threat response
+	AltThreatMode  = false,
+	AltThreatAction= "fling",
+	AltThreatBusy  = false,
+	-- Alt: save farmer
+	AltSaveFarmer  = false,
+	-- Chat commands
+	ChatCmdEnabled = false,
+	-- Anti-void
+	AltAntiVoid    = false,
+	FarmerAntiVoid = false,
+	AltAntiVoidThread    = nil,
+	FarmerAntiVoidThread = nil,
 }
 _G.PH_SPAWN = State.AltSpawnPlace
 
@@ -108,6 +122,19 @@ local function sc(fn, ...)
 	local ok, err = pcall(fn, ...)
 	if not ok then log("err: " .. tostring(err), "ERR") end
 	return ok
+end
+
+-- ── Helper: find grab-skill (Flowing Water / Lethal Whirlwind Stream) ──
+local GRAB_SKILL_NAMES = {'Flowing Water', 'Lethal Whirlwind Stream'}
+local function findGrabSkillIndex()
+	local bp={}
+	for _,t in ipairs(plr.Backpack:GetChildren()) do if t:IsA("Tool") then table.insert(bp,t) end end
+	for i,t in ipairs(bp) do
+		for _,name in ipairs(GRAB_SKILL_NAMES) do
+			if t.Name:find(name,1,true) then return i,t end
+		end
+	end
+	return nil,nil
 end
 
 -- ── Combat inputs ─────────────────────────────────────────────
@@ -458,6 +485,9 @@ startFarmerLoop = function()
 	end)
 
 	State.FarmerThread = task.spawn(function()
+		-- Track which alt we're currently locked onto (index into resolvedTargets)
+		local currentTargetIdx = 1
+
 		while State.Running do
 			beat()
 			if State.ThreatDetected then
@@ -468,38 +498,77 @@ startFarmerLoop = function()
 				uiStatus("Relocated → " .. newLabel, Color3.fromRGB(52, 211, 153))
 				task.wait(3); continue
 			end
+
 			if #State.AltTargets == 0 then log("No targets","WARN"); task.wait(2); continue end
 			local resolvedTargets = getResolvedTargets(State.AltTargets)
 			if #resolvedTargets == 0 then log("No targets resolved (#all may be empty)","WARN"); task.wait(2); continue end
-			local targetName = resolvedTargets[State.LastFarmedIdx % #resolvedTargets + 1]
-			State.LastFarmedIdx = (State.LastFarmedIdx % #resolvedTargets) + 1
+
+			-- Clamp index in case target list shrank
+			if currentTargetIdx > #resolvedTargets then currentTargetIdx = 1 end
+			local targetName = resolvedTargets[currentTargetIdx]
+
 			local tp = Players:FindFirstChild(targetName)
-			if not tp then log("'" .. targetName .. "' not in server","WARN"); task.wait(1); continue end
+			if not tp then
+				log("'" .. targetName .. "' not in server — advancing","WARN")
+				currentTargetIdx = (currentTargetIdx % #resolvedTargets) + 1
+				task.wait(1); continue
+			end
 			local tc = tp.Character
-			if not tc then log(targetName .. " no character","WARN"); task.wait(2); continue end
+			if not tc then
+				log(targetName .. " no character","WARN"); task.wait(2); continue
+			end
 			local tHRP = tc:FindFirstChild("HumanoidRootPart")
-			if not tHRP then task.wait(0.5); continue end
+			local altHum = tc:FindFirstChildOfClass("Humanoid")
+			if not tHRP or not altHum then task.wait(0.5); continue end
+
+			-- Skip dead alts immediately — wait for respawn then continue
+			if altHum.Health <= 0 then task.wait(0.3); continue end
+
 			if not waitForChar(8) then log("Waiting to respawn","WARN"); task.wait(RECONNECT_WAIT); continue end
 
-			local altPos = tHRP.Position; State.CurrentFarmPos = altPos
-			-- Rapid teleport, face the alt in all axes
+			-- Rapid teleport: snap to alt position + face them with no delay
+			local altPos = tHRP.Position
+			State.CurrentFarmPos = altPos
 			local standPos = altPos + Vector3.new(0, 4.5, 0)
 			teleportFacing(standPos, altPos)
-			beat()
+
 			log("Attacking " .. targetName .. " [" .. State.AttackMode .. "]","FARM")
 			uiStatus("Attacking " .. targetName, Color3.fromRGB(99, 102, 241))
-			sc(function() runAttack(altPos) end); beat()
 
-			local altHum = tc:FindFirstChildOfClass("Humanoid")
-			if altHum and altHum.Health <= 0 then
+			-- Run the attack. During the attack, a background thread keeps us
+			-- snapped on top of the alt and facing them every frame.
+			local trackThread = task.spawn(function()
+				while State.Running do
+					task.wait()  -- one-frame yield = maximum update rate
+					local chr = tp.Character
+					if not chr then break end
+					local hrp2 = chr:FindFirstChild("HumanoidRootPart")
+					if not hrp2 then break end
+					local p2 = hrp2.Position
+					teleportFacing(p2 + Vector3.new(0, 4.5, 0), p2)
+				end
+			end)
+
+			sc(function() runAttack(altPos) end)
+			task.cancel(trackThread)  -- stop tracking once attack sequence ends
+
+			beat()
+
+			-- Refresh humanoid after attack — check if alt died
+			local altHum2 = tc:FindFirstChildOfClass("Humanoid")
+			if altHum2 and altHum2.Health <= 0 then
 				State.KillCount += 1
-				log("Kill #" .. State.KillCount .. " on " .. targetName,"FARM")
+				log("Kill #" .. State.KillCount .. " on " .. targetName .. " — next alt","FARM")
 				uiStatus("Kill #" .. State.KillCount, Color3.fromRGB(52, 211, 153))
+				-- Advance to next alt only on confirmed kill
+				currentTargetIdx = (currentTargetIdx % #resolvedTargets) + 1
 			end
+			-- If still alive, loop back and keep hitting the same alt
 		end
 		log("Farmer loop ended."); uiStatus("IDLE", Color3.fromRGB(120, 120, 160))
 	end)
 	startWatchdog(function() if State.Running then startFarmerLoop() end end)
+	if State.FarmerAntiVoid then startFarmerAntiVoid() end
 end
 
 stopFarmerLoop = function()
@@ -507,8 +576,51 @@ stopFarmerLoop = function()
 	for _, k in ipairs({"FarmerThread","ThreatThread","WatchdogThread"}) do
 		if State[k] then task.cancel(State[k]); State[k] = nil end
 	end
-	stopAntiAFK(); stopWatchdog()
+	stopAntiAFK(); stopWatchdog(); stopFarmerAntiVoid()
 	log("Farmer stopped."); uiStatus("IDLE", Color3.fromRGB(120, 120, 160))
+end
+
+-- ── Anti-void ─────────────────────────────────────────────────
+local function startAltAntiVoid()
+	if State.AltAntiVoidThread then task.cancel(State.AltAntiVoidThread) end
+	State.AltAntiVoidThread = task.spawn(function()
+		while State.AltAntiVoid do
+			task.wait()
+			local hrp = getHRP()
+			if hrp and hrp.Position.Y < 0 then
+				log("Alt anti-void triggered","ALT")
+				while hrp and hrp.Position.Y < 0 do
+					teleportTo(State.AltSpawnPlace)
+					task.wait()
+				end
+			end
+		end
+	end)
+end
+
+local function stopAltAntiVoid()
+	if State.AltAntiVoidThread then task.cancel(State.AltAntiVoidThread); State.AltAntiVoidThread=nil end
+end
+
+local function startFarmerAntiVoid()
+	if State.FarmerAntiVoidThread then task.cancel(State.FarmerAntiVoidThread) end
+	State.FarmerAntiVoidThread = task.spawn(function()
+		while State.FarmerAntiVoid do
+			task.wait()
+			local hrp = getHRP()
+			if hrp and hrp.Position.Y < 0 then
+				log("Farmer anti-void triggered","FARM")
+				while hrp and hrp.Position.Y < 0 do
+					teleportTo(State.CurrentFarmPos or SafePlaces[1].pos)
+					task.wait()
+				end
+			end
+		end
+	end)
+end
+
+local function stopFarmerAntiVoid()
+	if State.FarmerAntiVoidThread then task.cancel(State.FarmerAntiVoidThread); State.FarmerAntiVoidThread=nil end
 end
 
 startAltLoop = function()
@@ -531,27 +643,170 @@ startAltLoop = function()
 		while State.Running do
 			task.wait()   -- one-frame yield only, for maximum responsiveness
 			beat()
+
 			if _G.PH_SPAWN and _G.PH_SPAWN ~= State.AltSpawnPlace then
 				State.AltSpawnPlace = _G.PH_SPAWN
 				log("Spawn updated by farmer → moving","ALT")
 			end
+
 			local hrp = getHRP()
-			if hrp then
-				-- Rapid correction: teleport if more than 5 studs off spawn
-				if (hrp.Position - State.AltSpawnPlace).Magnitude > 5 then
-					teleportTo(State.AltSpawnPlace)
+			if not hrp then continue end
+			local myPos = hrp.Position
+
+			-- ── Anti-void ──────────────────────────────────────────
+			if State.AltAntiVoid and myPos.Y < 0 then
+				log("Alt anti-void triggered","ALT")
+				while getHRP() and getHRP().Position.Y < 0 do
+					teleportTo(State.AltSpawnPlace); task.wait()
 				end
-				if State.AttackMode == "hit_reset" then
-					local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
-					if hum and hum.Health > 0 and hum.Health < (hum.MaxHealth * 0.3) then
-						log("HP < 30% → self-resetting","ALT"); task.wait(0.08); resetCharacter()
+				continue
+			end
+
+			-- ── Threat response (fling / kill) ──────────────────────
+			if State.AltThreatMode and not State.AltThreatBusy then
+				local ALT_THREAT_RADIUS = 50
+				-- find nearest stranger
+				local nearest, nearDist = nil, math.huge
+				for _, p in ipairs(Players:GetPlayers()) do
+					if p == plr then continue end
+					local isWL = false
+					for _, n in ipairs(getResolvedTargets(State.Whitelist)) do if p.Name==n then isWL=true; break end end
+					if isWL then continue end
+					local pc = p.Character
+					if pc then
+						local phrp = pc:FindFirstChild("HumanoidRootPart")
+						if phrp then
+							local d = (phrp.Position - myPos).Magnitude
+							if d <= ALT_THREAT_RADIUS and d < nearDist then nearest=p; nearDist=d end
+						end
 					end
 				end
+
+				if nearest then
+					State.AltThreatBusy = true
+					log("Threat detected: "..nearest.Name.." ["..State.AltThreatAction.."]","ALT")
+					uiStatus("Threat: "..nearest.Name, Color3.fromRGB(248,113,113))
+					local savedRunning = State.Running
+					State.Running = false  -- pause main loop temporarily
+
+					local threatThread = task.spawn(function()
+						if State.AltThreatAction == "fling" then
+							-- FLING: stick and spin at massive angular velocity
+							local startPos = myPos
+							local angle = 0
+							while true do
+								local tc = nearest.Character
+								if not tc then break end
+								local thrp = tc:FindFirstChild("HumanoidRootPart")
+								if not thrp then break end
+								local tpos = thrp.Position
+								-- Check if threat is far enough from start pos
+								if (tpos - startPos).Magnitude > ALT_THREAT_RADIUS then break end
+								angle = angle + math.rad(180)  -- spin very fast each frame
+								local offset = CFrame.new(tpos) * CFrame.Angles(0, angle, 0) * CFrame.new(3, 2, 0)
+								local hrp2 = getHRP()
+								if hrp2 then hrp2.CFrame = offset end
+								task.wait()
+							end
+						else
+							-- KILL: get behind → grab skill → void kill
+							local tc = nearest.Character
+							if tc then
+								local thrp = tc:FindFirstChild("HumanoidRootPart")
+								if thrp then
+									local tpos = thrp.Position
+									-- Teleport rapidly behind the target
+									for _ = 1, 5 do
+										local behind = tpos + (thrp.CFrame.LookVector * -3) + Vector3.new(0,2,0)
+										teleportFacing(behind, tpos)
+										task.wait()
+									end
+									local si, _ = findGrabSkillIndex()
+									if si then
+										skill(si)
+										task.wait(0.5)
+										-- Teleport under map to void-kill grabbed target
+										teleportTo(Vector3.new(myPos.X, -5000, myPos.Z))
+									else
+										-- No grab skill: spam all skills
+										for s = 1, 4 do skill(s); task.wait(skillDelay[s]) end
+									end
+								end
+							end
+						end
+					end)
+
+					-- Wait for threat thread to finish (max 8s)
+					local t0 = tick()
+					repeat task.wait(0.05) until not coroutine.status or tick()-t0 > 8
+					task.cancel(threatThread)
+
+					State.Running = savedRunning
+					State.AltThreatBusy = false
+					uiStatus("ALT ACTIVE", Color3.fromRGB(139, 92, 246))
+					continue
+				end
+			end
+
+			-- ── Save whitelisted farmer ─────────────────────────────
+			if State.AltSaveFarmer then
+				for _, wname in ipairs(getResolvedTargets(State.Whitelist)) do
+					local fp = Players:FindFirstChild(wname)
+					if fp and fp.Character then
+						local fhrp = fp.Character:FindFirstChild("HumanoidRootPart")
+						if fhrp and fhrp.Position.Y < 0 then
+							log("Saving farmer: "..wname,"ALT")
+							local si, _ = findGrabSkillIndex()
+							if si then
+								-- Teleport to farmer, use grab skill, bring to spawn
+								teleportFacing(fhrp.Position + Vector3.new(0,3,0), fhrp.Position)
+								task.wait(0.1)
+								skill(si)
+								task.wait(0.5)
+								teleportTo(State.AltSpawnPlace)
+							else
+								-- No grab skill: just teleport farmer's character to spawn
+								if fp.Character:FindFirstChild("HumanoidRootPart") then
+									fp.Character.HumanoidRootPart.CFrame = CFrame.new(State.AltSpawnPlace)
+								end
+							end
+						end
+					end
+				end
+			end
+
+			-- ── Hit+reset self ──────────────────────────────────────
+			if State.AltHitReset then
+				local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+				if hum and hum.Health > 0 and hum.MaxHealth > 0 then
+					local pct = hum.Health / hum.MaxHealth
+					if pct <= 0.91 then
+						log("Alt HP "..math.floor(pct*100).."% → force resetting","ALT")
+						while plr.Character and plr.Character:FindFirstChildOfClass("Humanoid") and
+							  plr.Character:FindFirstChildOfClass("Humanoid").Health > 0 do
+							resetCharacter(); task.wait(0.05)
+						end
+					end
+				end
+			end
+
+			-- ── Legacy hit_reset mode (30% threshold) ───────────────
+			if State.AttackMode == "hit_reset" then
+				local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+				if hum and hum.Health > 0 and hum.Health < (hum.MaxHealth * 0.3) then
+					log("HP < 30% → self-resetting","ALT"); task.wait(0.08); resetCharacter()
+				end
+			end
+
+			-- ── Stay at spawn ────────────────────────────────────────
+			if (myPos - State.AltSpawnPlace).Magnitude > 5 then
+				teleportTo(State.AltSpawnPlace)
 			end
 		end
 		log("Alt loop ended."); uiStatus("IDLE", Color3.fromRGB(120, 120, 160))
 	end)
 	startWatchdog(function() if State.Running then startAltLoop() end end)
+	if State.AltAntiVoid then startAltAntiVoid() end
 end
 
 stopAltLoop = function()
@@ -559,13 +814,341 @@ stopAltLoop = function()
 	for _, k in ipairs({"AltThread","WatchdogThread"}) do
 		if State[k] then task.cancel(State[k]); State[k] = nil end
 	end
-	stopAntiAFK(); stopWatchdog()
+	stopAntiAFK(); stopWatchdog(); stopAltAntiVoid()
 	log("Alt stopped."); uiStatus("IDLE", Color3.fromRGB(120, 120, 160))
 end
 
 plr.CharacterAdded:Connect(function(c)
 	character = c; communicate = c:WaitForChild("Communicate", 5) or communicate
 end)
+
+-- ── FallenPartsDestroyHeight: push extremely low so the void is deep ──
+pcall(function() workspace.FallenPartsDestroyHeight = -99999 end)
+
+-- ── Chat commands (farmer→alts) ───────────────────────────────
+-- Supports normal, /e, /system prefix. Commands:
+--   stopalt        → stop alt loop
+--   startalt       → start alt loop
+--   saveme         → teleport alt to farmer position
+--   kill {player}  → alt swarms named player
+local function stripChatPrefix(msg)
+	msg = msg:match("^%s*(.-)%s*$")
+	msg = msg:gsub("^/e%s+", "")
+	msg = msg:gsub("^/system%s+", "")
+	return msg:lower()
+end
+
+-- ── Command registry ──────────────────────────────────────────
+-- Each entry: { pattern, handler(speaker, args, msg) }
+-- 'args' is a table of space-split tokens after the command word
+-- 'msg' is the full stripped message string
+
+local CMD_HELP = {
+	"stopalt          – stop the alt loop",
+	"startalt         – start the alt loop",
+	"restart          – stop then immediately restart the alt loop",
+	"saveme           – rescue the farmer from the void",
+	"goto me          – teleport alt to the farmer",
+	"kill {name}      – void-kill a specific player",
+	"fling {name}     – fling a specific player",
+	"follow {name}    – stick to player until 'unfollow'",
+	"unfollow         – stop following",
+	"spawn {n|random} – switch spawn to SafePlace index or random",
+	"spawn xyz {x} {y} {z} – set spawn to exact coords",
+	"mode {name}      – set attack mode (ordered/spam/custom/hit_reset/trashcan)",
+	"m1delay {n}      – set M1 delay in seconds",
+	"skilldel {1-4} {n} – set per-skill delay",
+	"antivoid on|off  – toggle alt anti-void",
+	"threatmode on|off – toggle threat response",
+	"threataction fling|kill – set threat action",
+	"hitreset on|off  – toggle hit+reset self",
+	"status           – log current alt state",
+	"where            – farmer teleports alt to their own position",
+	"reset            – force reset the alt character",
+	"help             – print this command list",
+}
+
+local _followThread = nil
+local _followTarget = nil
+
+local function stopFollow()
+	if _followThread then task.cancel(_followThread); _followThread=nil end
+	_followTarget = nil
+end
+
+local function doVoidKill(targetPlayer)
+	if not targetPlayer or not targetPlayer.Character then return end
+	local thrp = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+	if not thrp then return end
+	local tpos = thrp.Position
+	local si = findGrabSkillIndex()
+	if si then
+		teleportFacing(tpos + Vector3.new(0,3,-3), tpos)
+		task.wait(0.1); skill(si); task.wait(0.5)
+		teleportTo(Vector3.new(tpos.X, -5000, tpos.Z))
+	else
+		for s = 1, 4 do
+			teleportFacing(tpos + Vector3.new(0,3,-3), tpos)
+			skill(s); task.wait(skillDelay[s])
+		end
+	end
+end
+
+local function doFling(targetPlayer)
+	if not targetPlayer or not targetPlayer.Character then return end
+	local angle = 0
+	local t0 = tick()
+	local startPos = targetPlayer.Character:FindFirstChild("HumanoidRootPart") and
+		targetPlayer.Character.HumanoidRootPart.Position or Vector3.new(0,0,0)
+	while tick()-t0 < 6 do
+		local tc = targetPlayer.Character
+		if not tc then break end
+		local thrp2 = tc:FindFirstChild("HumanoidRootPart")
+		if not thrp2 then break end
+		angle = angle + math.rad(180)
+		local offset = CFrame.new(thrp2.Position) * CFrame.Angles(0,angle,0) * CFrame.new(3,2,0)
+		local myHrp = getHRP(); if myHrp then myHrp.CFrame = offset end
+		task.wait()
+	end
+end
+
+local function resolvePlayerArg(name)
+	if name == "me" or name == "" or name == nil then return nil end
+	return Players:FindFirstChild(name)
+end
+
+local function setSpawnByIndex(idx)
+	if SafePlaces[idx] then
+		State.AltSpawnPlace = SafePlaces[idx].pos
+		_G.PH_SPAWN = State.AltSpawnPlace
+		teleportTo(State.AltSpawnPlace)
+		return SafePlaces[idx].label
+	end
+	return nil
+end
+
+local ATTACK_MODES = {ordered=true, spam=true, custom=true, hit_reset=true, trashcan=true}
+
+local function handleChatCommand(speaker, rawMsg)
+	if not State.ChatCmdEnabled then return end
+	local wl = getResolvedTargets(State.Whitelist)
+	local isWhitelisted = false
+	for _, n in ipairs(wl) do if speaker.Name == n then isWhitelisted=true; break end end
+	if not isWhitelisted then return end
+
+	local msg = stripChatPrefix(rawMsg)
+	local tokens = {}
+	for tok in msg:gmatch("%S+") do table.insert(tokens, tok) end
+	local cmd = tokens[1] or ""
+	local args = {}
+	for i = 2, #tokens do table.insert(args, tokens[i]) end
+
+	log("CMD ["..speaker.Name.."]: "..msg, "ALT")
+
+	-- ── stopalt ──────────────────────────────────────────────────
+	if cmd == "stopalt" then
+		if State.Running and State.Role == "Alt" then stopAltLoop() end
+		uiStatus("Stopped by "..speaker.Name, Color3.fromRGB(248,113,113))
+
+	-- ── startalt ─────────────────────────────────────────────────
+	elseif cmd == "startalt" then
+		if not State.Running and State.Role == "Alt" then startAltLoop() end
+
+	-- ── restart ──────────────────────────────────────────────────
+	elseif cmd == "restart" then
+		if State.Role == "Alt" then
+			if State.Running then stopAltLoop() end
+			task.wait(0.5)
+			startAltLoop()
+		end
+
+	-- ── saveme ───────────────────────────────────────────────────
+	elseif cmd == "saveme" then
+		if speaker.Character then
+			local fhrp = speaker.Character:FindFirstChild("HumanoidRootPart")
+			if fhrp then
+				local si = findGrabSkillIndex()
+				if si then
+					teleportFacing(fhrp.Position + Vector3.new(0,3,0), fhrp.Position)
+					task.wait(0.1); skill(si); task.wait(0.5)
+					teleportTo(State.AltSpawnPlace)
+				else
+					teleportTo(fhrp.Position + Vector3.new(0,4,0))
+				end
+			end
+		end
+
+	-- ── goto me ──────────────────────────────────────────────────
+	elseif cmd == "goto" and (args[1] or "") == "me" then
+		if speaker.Character then
+			local fhrp = speaker.Character:FindFirstChild("HumanoidRootPart")
+			if fhrp then teleportTo(fhrp.Position + Vector3.new(0,4,0)) end
+		end
+
+	-- ── kill {name} ───────────────────────────────────────────────
+	elseif cmd == "kill" then
+		local tp = resolvePlayerArg(args[1]) or speaker
+		task.spawn(doVoidKill, tp)
+
+	-- ── fling {name} ──────────────────────────────────────────────
+	elseif cmd == "fling" then
+		local tp = resolvePlayerArg(args[1]) or speaker
+		local wasRunning = State.Running
+		if State.Running then State.Running = false end
+		task.spawn(function()
+			doFling(tp)
+			if wasRunning and State.Role == "Alt" then startAltLoop() end
+		end)
+
+	-- ── follow {name} ─────────────────────────────────────────────
+	elseif cmd == "follow" then
+		local tp = resolvePlayerArg(args[1]) or speaker
+		stopFollow()
+		_followTarget = tp
+		local wasRunning = State.Running
+		if State.Running then State.Running = false end
+		_followThread = task.spawn(function()
+			log("Following "..tp.Name,"ALT")
+			while _followTarget == tp do
+				local tc = tp.Character
+				if tc then
+					local thrp = tc:FindFirstChild("HumanoidRootPart")
+					if thrp then
+						teleportFacing(thrp.Position + Vector3.new(0,4,0), thrp.Position)
+					end
+				end
+				task.wait()
+			end
+			if wasRunning and State.Role == "Alt" then startAltLoop() end
+		end)
+
+	-- ── unfollow ──────────────────────────────────────────────────
+	elseif cmd == "unfollow" then
+		stopFollow()
+		if State.Role == "Alt" and not State.Running then startAltLoop() end
+
+	-- ── spawn {n|random} ─────────────────────────────────────────
+	elseif cmd == "spawn" then
+		local sub = args[1] or ""
+
+		if sub == "random" then
+			local idx = math.random(1, #SafePlaces)
+			local label = setSpawnByIndex(idx)
+			log("Spawn → random → "..tostring(label).." (#"..idx..")","ALT")
+
+		elseif sub == "xyz" then
+			-- spawn xyz X Y Z
+			local x,y,z = tonumber(args[2]),tonumber(args[3]),tonumber(args[4])
+			if x and y and z then
+				State.AltSpawnPlace = Vector3.new(x,y,z)
+				_G.PH_SPAWN = State.AltSpawnPlace
+				teleportTo(State.AltSpawnPlace)
+				log("Spawn → custom XYZ ("..x..","..y..","..z..")","ALT")
+			else
+				log("spawn xyz: bad coords","WARN")
+			end
+
+		else
+			local idx = tonumber(sub)
+			if idx then
+				local label = setSpawnByIndex(math.clamp(idx,1,#SafePlaces))
+				log("Spawn → #"..idx.." ("..tostring(label)..")","ALT")
+			else
+				log("spawn: unknown arg '"..sub.."'","WARN")
+			end
+		end
+
+	-- ── mode {name} ───────────────────────────────────────────────
+	elseif cmd == "mode" then
+		local m = args[1] or ""
+		if ATTACK_MODES[m] then
+			State.AttackMode = m
+			log("Attack mode → "..m,"ALT")
+		else
+			log("mode: unknown '"..m.."' (ordered/spam/custom/hit_reset/trashcan)","WARN")
+		end
+
+	-- ── m1delay {n} ───────────────────────────────────────────────
+	elseif cmd == "m1delay" then
+		local v = tonumber(args[1])
+		if v and v >= 0 then m1Delay=v; log("M1 delay → "..v.."s","ALT")
+		else log("m1delay: expected a number","WARN") end
+
+	-- ── skilldel {1-4} {n} ────────────────────────────────────────
+	elseif cmd == "skilldel" then
+		local idx = tonumber(args[1]); local v = tonumber(args[2])
+		if idx and v and idx>=1 and idx<=4 and v>=0 then
+			skillDelay[idx]=v; log("Skill "..idx.." delay → "..v.."s","ALT")
+		else log("skilldel: usage  skilldel 1 0.4","WARN") end
+
+	-- ── antivoid on|off ───────────────────────────────────────────
+	elseif cmd == "antivoid" then
+		local v = (args[1] or "") == "on"
+		State.AltAntiVoid = v
+		if v then startAltAntiVoid() else stopAltAntiVoid() end
+		log("Alt anti-void → "..(v and "ON" or "OFF"),"ALT")
+
+	-- ── threatmode on|off ─────────────────────────────────────────
+	elseif cmd == "threatmode" then
+		State.AltThreatMode = (args[1] or "") == "on"
+		log("Threat mode → "..(State.AltThreatMode and "ON" or "OFF"),"ALT")
+
+	-- ── threataction fling|kill ───────────────────────────────────
+	elseif cmd == "threataction" then
+		local a = args[1] or ""
+		if a == "fling" or a == "kill" then
+			State.AltThreatAction = a; log("Threat action → "..a,"ALT")
+		else log("threataction: fling or kill","WARN") end
+
+	-- ── hitreset on|off ───────────────────────────────────────────
+	elseif cmd == "hitreset" then
+		State.AltHitReset = (args[1] or "") == "on"
+		log("Hit+Reset → "..(State.AltHitReset and "ON" or "OFF"),"ALT")
+
+	-- ── reset ─────────────────────────────────────────────────────
+	elseif cmd == "reset" then
+		log("Force reset by "..speaker.Name,"ALT")
+		resetCharacter()
+
+	-- ── where ─────────────────────────────────────────────────────
+	-- Teleport this alt to the farmer's current position
+	elseif cmd == "where" then
+		if speaker.Character then
+			local fhrp = speaker.Character:FindFirstChild("HumanoidRootPart")
+			if fhrp then
+				State.AltSpawnPlace = fhrp.Position
+				_G.PH_SPAWN = State.AltSpawnPlace
+				teleportTo(State.AltSpawnPlace)
+				log("Snapped to farmer position","ALT")
+			end
+		end
+
+	-- ── status ───────────────────────────────────────────────────
+	elseif cmd == "status" then
+		local up = State.StartTime > 0 and math.floor(tick()-State.StartTime) or 0
+		log(string.format("Role=%s Running=%s Mode=%s Kills=%d Uptime=%dm%ds Spawn=(%d,%d,%d)",
+			tostring(State.Role), tostring(State.Running), State.AttackMode,
+			State.KillCount, math.floor(up/60), up%60,
+			math.floor(State.AltSpawnPlace.X),
+			math.floor(State.AltSpawnPlace.Y),
+			math.floor(State.AltSpawnPlace.Z)
+		),"ALT")
+
+	-- ── help ─────────────────────────────────────────────────────
+	elseif cmd == "help" then
+		for _, line in ipairs(CMD_HELP) do log(line,"ALT") end
+	end
+end
+
+-- Hook every player's chat (needed to catch messages even with /e prefix)
+local function hookPlayerChat(p)
+	local ok, chatted = pcall(function() return p.Chatted end)
+	if ok and chatted then
+		chatted:Connect(function(msg) task.spawn(handleChatCommand, p, msg) end)
+	end
+end
+for _, p in ipairs(Players:GetPlayers()) do hookPlayerChat(p) end
+Players.PlayerAdded:Connect(hookPlayerChat)
 
 task.defer(function()
 	if State.AutoStart and State.Role then
@@ -1197,6 +1780,69 @@ do
 		State.Whitelist = parseNameBox(farmerBox.Text)
 	end)
 
+	-- ── Hit+Reset toggle ──────────────────────────────────────────
+	local cHR = card(p,35); section(cHR,"Hit + Reset (Self)",0)
+	lbl(cHR,"Alt auto-resets when HP drops to ~91%",9,C.muted,false,1)
+	local hrRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=2},cHR)
+	lbl(hrRow,"Enable Hit+Reset",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local hrTog = makeToggle(hrRow,"OFF","ON",false,function(v) State.AltHitReset=v end)
+	hrTog.Position=UDim2.new(1,-52,0,1)
+
+	-- ── Threat Response ───────────────────────────────────────────
+	local cTR = card(p,36); section(cTR,"Threat Response (50 stud radius)",0)
+	lbl(cTR,"Auto react to strangers: fling or kill",9,C.muted,false,1)
+	local trRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=2},cTR)
+	lbl(trRow,"Enable Threat Response",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local trTog = makeToggle(trRow,"OFF","ON",false,function(v) State.AltThreatMode=v end)
+	trTog.Position=UDim2.new(1,-52,0,1)
+	-- Mode picker
+	local modeRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=3},cTR)
+	hlist(modeRow,6)
+	local flingBtn = mk("TextButton",{Text="Fling",TextSize=10,TextColor3=C.text,
+		Font=Enum.Font.GothamBold,BackgroundColor3=C.accent,AutoButtonColor=false,
+		Size=UDim2.new(0.5,-3,1,0),LayoutOrder=1},modeRow); corner(flingBtn,5)
+	local killBtn2 = mk("TextButton",{Text="Kill",TextSize=10,TextColor3=C.text,
+		Font=Enum.Font.GothamBold,BackgroundColor3=C.card,AutoButtonColor=false,
+		Size=UDim2.new(0.5,-3,1,0),LayoutOrder=2},modeRow); corner(killBtn2,5); stroke(killBtn2,C.border)
+	local function setThreatMode(m)
+		State.AltThreatAction=m
+		tw(flingBtn,FAST,{BackgroundColor3=m=="fling" and C.accent or C.card})
+		tw(killBtn2,FAST,{BackgroundColor3=m=="kill"  and C.danger or C.card})
+	end
+	flingBtn.MouseButton1Click:Connect(function() setThreatMode("fling") end)
+	killBtn2.MouseButton1Click:Connect(function() setThreatMode("kill") end)
+
+	-- ── Save Farmer ───────────────────────────────────────────────
+	local cSF = card(p,37); section(cSF,"Save Farmer",0)
+	lbl(cSF,"Rescue whitelisted farmer if they fall below Y=0",9,C.muted,false,1)
+	local sfRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=2},cSF)
+	lbl(sfRow,"Enable Save Farmer",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local sfTog = makeToggle(sfRow,"OFF","ON",false,function(v) State.AltSaveFarmer=v end)
+	sfTog.Position=UDim2.new(1,-52,0,1)
+
+	-- ── Chat Commands ─────────────────────────────────────────────
+	local cCC = card(p,38); section(cCC,"Chat Commands (from whitelisted farmer)",0)
+	lbl(cCC,"stopalt · startalt · restart · saveme · goto me",9,C.muted,false,1)
+	lbl(cCC,"kill/fling {name} · follow/unfollow {name}",9,C.muted,false,2)
+	lbl(cCC,"spawn {1-8|random} · spawn xyz X Y Z",9,C.muted,false,3)
+	lbl(cCC,"mode · m1delay · skilldel · antivoid · hitreset",9,C.muted,false,4)
+	lbl(cCC,"threatmode · threataction · reset · where · status · help",9,C.muted,false,5)
+	lbl(cCC,"Detects /e and /system prefixes automatically",9,C.accent,false,6)
+	local ccRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=7},cCC)
+	lbl(ccRow,"Enable Chat Commands",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local ccTog = makeToggle(ccRow,"OFF","ON",false,function(v) State.ChatCmdEnabled=v end)
+	ccTog.Position=UDim2.new(1,-52,0,1)
+
+	-- ── Anti-Void (Alt) ───────────────────────────────────────────
+	local cAV = card(p,39); section(cAV,"Anti-Void",0)
+	lbl(cAV,"Spam-teleports alt to spawn if Y < 0",9,C.muted,false,1)
+	local avRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=2},cAV)
+	lbl(avRow,"Alt Anti-Void",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local avTog = makeToggle(avRow,"OFF","ON",false,function(v)
+		State.AltAntiVoid=v
+		if v then startAltAntiVoid() else stopAltAntiVoid() end
+	end); avTog.Position=UDim2.new(1,-52,0,1)
+
 	local c4 = card(p,4); section(c4,"Alt Controls",0)
 	local sAltBtn = bigBtn(c4,"▶  START ALT MODE",C.hot,1)
 	sAltBtn.Size=UDim2.new(1,0,0,38); sAltBtn.TextSize=13
@@ -1257,6 +1903,15 @@ do
 
 	local c4 = card(p,4); section(c4,"Watchdog",0)
 	lbl(c4,"Auto-restarts frozen loops every 30s. Always active while running.",10,C.muted,false,1)
+
+	local c5 = card(p,5); section(c5,"Anti-Void (Farmer)",0)
+	lbl(c5,"Spam-teleports farmer to last farm pos if Y < 0",9,C.muted,false,1)
+	local favRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=2},c5)
+	lbl(favRow,"Farmer Anti-Void",10,C.muted).Size=UDim2.new(1,-56,1,0)
+	local favTog = makeToggle(favRow,"OFF","ON",false,function(v)
+		State.FarmerAntiVoid=v
+		if v then startFarmerAntiVoid() else stopFarmerAntiVoid() end
+	end); favTog.Position=UDim2.new(1,-52,0,1)
 end
 
 -- ============================================================
