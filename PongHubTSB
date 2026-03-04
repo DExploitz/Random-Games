@@ -1,6 +1,6 @@
 -- ============================================================
 --  PONG HUB v2  |  The Strongest Battlegrounds
---  ► LOADSTRING USAGE:
+--  ► PASTEBIN / LOADSTRING USAGE:
 --    _G.PH_ROLE         = "Farmer"
 --    _G.PH_ALTS         = {"Alt1","Alt2"}
 --    _G.PH_SPAWN        = Vector3.new(x,y,z)
@@ -8,7 +8,7 @@
 --    _G.PH_CUSTOM_COMBO = "4 m1, 1, dash"
 --    _G.PH_ORDERED_DASH = false
 --    _G.PH_AUTOSTART    = true
---    loadstring(game:HttpGet("https://raw.githubusercontent.com/DExploitz/Random-Games/refs/heads/main/PongHubTSB"))()
+--    loadstring(game:HttpGet("https://pastebin.com/raw/YOURCODE"))()
 -- ============================================================
 
 local REQUIRED_PLACE_ID = 10449761463
@@ -97,6 +97,7 @@ local State = {
 	AltSaveFarmer  = false,
 	-- Chat commands
 	ChatCmdEnabled = false,
+	CmdPrefix      = "_",  -- command prefix, e.g. "_say hello"
 	-- Anti-void
 	AltAntiVoid    = false,
 	FarmerAntiVoid = false,
@@ -457,8 +458,11 @@ local function runAttack(altPos)
 end
 
 -- ── Main loops ────────────────────────────────────────────────
+-- Forward declarations so all loop functions can reference each other freely
 local startFarmerLoop, stopFarmerLoop
 local startAltLoop,    stopAltLoop
+local startAltAntiVoid, stopAltAntiVoid
+local startFarmerAntiVoid, stopFarmerAntiVoid
 
 startFarmerLoop = function()
 	if State.FarmerThread then task.cancel(State.FarmerThread) end
@@ -581,7 +585,7 @@ stopFarmerLoop = function()
 end
 
 -- ── Anti-void ─────────────────────────────────────────────────
-local function startAltAntiVoid()
+startAltAntiVoid = function()
 	if State.AltAntiVoidThread then task.cancel(State.AltAntiVoidThread) end
 	State.AltAntiVoidThread = task.spawn(function()
 		while State.AltAntiVoid do
@@ -598,11 +602,11 @@ local function startAltAntiVoid()
 	end)
 end
 
-local function stopAltAntiVoid()
+stopAltAntiVoid = function()
 	if State.AltAntiVoidThread then task.cancel(State.AltAntiVoidThread); State.AltAntiVoidThread=nil end
 end
 
-local function startFarmerAntiVoid()
+startFarmerAntiVoid = function()
 	if State.FarmerAntiVoidThread then task.cancel(State.FarmerAntiVoidThread) end
 	State.FarmerAntiVoidThread = task.spawn(function()
 		while State.FarmerAntiVoid do
@@ -619,7 +623,7 @@ local function startFarmerAntiVoid()
 	end)
 end
 
-local function stopFarmerAntiVoid()
+stopFarmerAntiVoid = function()
 	if State.FarmerAntiVoidThread then task.cancel(State.FarmerAntiVoidThread); State.FarmerAntiVoidThread=nil end
 end
 
@@ -835,7 +839,13 @@ local function stripChatPrefix(msg)
 	msg = msg:match("^%s*(.-)%s*$")
 	msg = msg:gsub("^/e%s+", "")
 	msg = msg:gsub("^/system%s+", "")
-	return msg:lower()
+	msg = msg:lower()
+	-- Strip configurable command prefix (e.g. "_")
+	local pfx = State.CmdPrefix or ""
+	if pfx ~= "" and msg:sub(1, #pfx) == pfx then
+		msg = msg:sub(#pfx + 1)
+	end
+	return msg
 end
 
 -- ── Command registry ──────────────────────────────────────────
@@ -844,32 +854,75 @@ end
 -- 'msg' is the full stripped message string
 
 local CMD_HELP = {
-	"stopalt          – stop the alt loop",
-	"startalt         – start the alt loop",
-	"restart          – stop then immediately restart the alt loop",
-	"saveme           – rescue the farmer from the void",
-	"goto me          – teleport alt to the farmer",
-	"kill {name}      – void-kill a specific player",
-	"fling {name}     – fling a specific player",
-	"follow {name}    – stick to player until 'unfollow'",
-	"unfollow         – stop following",
-	"spawn {n|random} – switch spawn to SafePlace index or random",
+	"stopalt            – stop the alt loop",
+	"startalt           – start the alt loop",
+	"restart            – stop then immediately restart the alt loop",
+	"saveme             – rescue the farmer from the void",
+	"goto me            – teleport alt to the farmer",
+	"kill {name}        – void-kill a specific player",
+	"fling {name}       – fling a specific player",
+	"follow {name}      – stick to player (teleport) until unfollow",
+	"unfollow           – stop following",
+	"walkto {name}      – walk to player each frame (humanoid)",
+	"unwalkto           – stop walkto",
+	"say {text}         – make alt say text in chat",
+	"trash {name}       – grab trashcan, lock on to player, throw (m1), hold for trash delay",
+	"spawn {n|random}   – switch spawn to SafePlace index or random",
 	"spawn xyz {x} {y} {z} – set spawn to exact coords",
-	"mode {name}      – set attack mode (ordered/spam/custom/hit_reset/trashcan)",
-	"m1delay {n}      – set M1 delay in seconds",
+	"mode {name}        – set attack mode",
+	"m1delay {n}        – set M1 delay in seconds",
 	"skilldel {1-4} {n} – set per-skill delay",
-	"antivoid on|off  – toggle alt anti-void",
-	"threatmode on|off – toggle threat response",
+	"antivoid on|off    – toggle alt anti-void",
+	"threatmode on|off  – toggle threat response",
 	"threataction fling|kill – set threat action",
-	"hitreset on|off  – toggle hit+reset self",
-	"status           – log current alt state",
-	"where            – farmer teleports alt to their own position",
-	"reset            – force reset the alt character",
-	"help             – print this command list",
+	"hitreset on|off    – toggle hit+reset self",
+	"status             – log current alt state",
+	"where              – snap alt to farmer position",
+	"reset              – force reset the alt character",
+	"tp {alt} {target|spawn|xyz X Y Z} – bring a player to coords using grab skill",
+	"prefix {char}      – set new command prefix (default: _)",
+	"help               – print this command list",
 }
+
+-- ── Visible trashcan finder ────────────────────────────────────
+-- Checks up to 100 times with 0.1s delay for a visible (Transparency==0) Trashcan
+local function findVisibleTrashcan()
+	local mapFolder = workspace:FindFirstChild("Map")
+	local trashFolder = mapFolder and mapFolder:FindFirstChild("Trash")
+	if not trashFolder then return nil end
+
+	local function getVisibleCans()
+		local visible = {}
+		for _, v in ipairs(trashFolder:GetChildren()) do
+			if v.Name == "Trashcan" then
+				local part = v:FindFirstChild("Trashcan")
+				if part and part:IsA("BasePart") and part.Transparency == 0 then
+					table.insert(visible, part)
+				end
+			end
+		end
+		return visible
+	end
+
+	for attempt = 1, 100 do
+		local visible = getVisibleCans()
+		if #visible > 0 then
+			return visible[math.random(1, #visible)]
+		end
+		task.wait(0.1)
+	end
+	return nil
+end
 
 local _followThread = nil
 local _followTarget = nil
+local _walktoThread = nil
+local _walktoTarget = nil
+
+local function stopWalkto()
+	if _walktoThread then task.cancel(_walktoThread); _walktoThread=nil end
+	_walktoTarget = nil
+end
 
 local function stopFollow()
 	if _followThread then task.cancel(_followThread); _followThread=nil end
@@ -1133,6 +1186,253 @@ local function handleChatCommand(speaker, rawMsg)
 			math.floor(State.AltSpawnPlace.Y),
 			math.floor(State.AltSpawnPlace.Z)
 		),"ALT")
+
+	-- ── walkto {name} ──────────────────────────────────────────────
+	elseif cmd == "walkto" then
+		local tp = resolvePlayerArg(args[1]) or speaker
+		stopWalkto(); stopFollow()
+		_walktoTarget = tp
+		local wasRunning = State.Running
+		if State.Running then State.Running = false end
+		_walktoThread = task.spawn(function()
+			log("Walking to "..tp.Name,"ALT")
+			local myHum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+			while _walktoTarget == tp do
+				local tc = tp.Character
+				if tc then
+					local thrp = tc:FindFirstChild("HumanoidRootPart")
+					if thrp then
+						-- Refresh humanoid each frame in case of respawn
+						myHum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+						if myHum then
+							myHum:MoveTo(thrp.Position)
+						end
+					end
+				end
+				task.wait(0.1)
+			end
+			if wasRunning and State.Role == "Alt" then startAltLoop() end
+		end)
+
+	-- ── unwalkto ──────────────────────────────────────────────────
+	elseif cmd == "unwalkto" then
+		stopWalkto()
+		if State.Role == "Alt" and not State.Running then startAltLoop() end
+
+	-- ── say {text} ────────────────────────────────────────────────
+	elseif cmd == "say" then
+		-- Reconstruct full text after "say "
+		local text = rawMsg:match("^%s*(.-)%s*$")
+		-- Strip /e /system prefix
+		text = text:gsub("^/e%s+", ""):gsub("^/system%s+", "")
+		-- Strip command prefix
+		local pfx = State.CmdPrefix or ""
+		if pfx ~= "" and text:sub(1,#pfx) == pfx then text = text:sub(#pfx+1) end
+		-- Strip "say " from front (case-insensitive)
+		text = text:match("^say%s+(.-)%s*$") or text:match("^say(.-)%s*$") or ""
+		if text ~= "" then
+			-- Try TextChatService (new chat system) first — sends to the actual chat box
+			local sent = false
+			pcall(function()
+				local tcs = game:GetService("TextChatService")
+				-- Find the general channel (RBXGeneral or first available TextChannel)
+				local channels = tcs:FindFirstChild("TextChannels")
+				if channels then
+					local general = channels:FindFirstChild("RBXGeneral")
+						or channels:FindFirstChildOfClass("TextChannel")
+					if general then
+						general:SendAsync(text)
+						sent = true
+					end
+				end
+			end)
+			-- Fallback: legacy Chat service (shows above head only in new chat, but works in legacy)
+			if not sent then
+				local ok2 = pcall(function()
+					plr:Chat(text)
+				end)
+				if not ok2 then
+					pcall(function()
+						game:GetService("Chat"):Chat(
+							plr.Character and plr.Character:FindFirstChild("Head"), text)
+					end)
+				end
+			end
+			log("Said: "..text,"ALT")
+		end
+
+	-- ── trash ─────────────────────────────────────────────────────
+	-- Grab a visible trashcan, m1, return to alt pos, m1, like TrashCan mode
+	elseif cmd == "trash" then
+		-- _trash {name}  →  grab a trashcan then rapidly face+teleport to target and m1
+		local targetName = args[1]
+		local throwTarget = targetName and resolvePlayerArg(targetName) or speaker
+		task.spawn(function()
+			local wasRunning = State.Running
+			if State.Running then State.Running = false end
+
+			log("Trash cmd: finding visible trashcan...","ALT")
+			local pp = findVisibleTrashcan()
+
+			if not pp then
+				log("Trash cmd: no visible trashcan found after 100 attempts","WARN")
+				if wasRunning and State.Role == "Alt" then startAltLoop() end
+				return
+			end
+
+			-- Step 1: Teleport to the trashcan and pick it up (m1)
+			local canPos = pp.Position
+			local standPos = canPos + Vector3.new(0, 4, -4)
+			teleportFacing(standPos, canPos)
+			task.wait(0.1)
+			m1()
+			task.wait(m1Delay)
+
+			-- Step 2: Rapidly teleport to target, facing them, and throw (m1)
+			-- Spawn a tracking thread that glues us on top of the target every frame
+			local tracking = true
+			local trackThread = task.spawn(function()
+				while tracking do
+					local tc = throwTarget.Character
+					if tc then
+						local thrp = tc:FindFirstChild("HumanoidRootPart")
+						if thrp then
+							local tpos = thrp.Position
+							teleportFacing(tpos + Vector3.new(0, 4.5, 0), tpos)
+						end
+					end
+					task.wait()  -- one frame = maximum speed
+				end
+			end)
+
+			-- Throw the trashcan at them after one frame of locking on
+			task.wait(0.1)
+			m1()
+
+			-- Step 3: Hold the facing+teleport for trashReturnWait seconds, then stop
+			task.wait(trashReturnWait)
+			tracking = false
+			task.cancel(trackThread)
+
+			log("Trash cmd: threw trashcan at "..(throwTarget and throwTarget.Name or "?"),"ALT")
+
+			if wasRunning and State.Role == "Alt" then startAltLoop() end
+		end)
+
+	-- ── tp {victimName} {targetName|spawn|xyz X Y Z} ───────────────
+	-- Teleport this alt to victimName, use grab skill to pick them up,
+	-- then teleport to the destination to drop them there.
+	-- destination can be:
+	--   a player name  → that player's current position
+	--   "spawn"        → this alt's current AltSpawnPlace
+	--   "xyz X Y Z"    → exact world coordinates
+	elseif cmd == "tp" then
+		local victimName = args[1]
+		local destArg    = args[2] or "spawn"   -- default to spawn if omitted
+
+		if not victimName then
+			log("tp: usage  tp {victim} {target|spawn|xyz X Y Z}","WARN")
+		else
+			task.spawn(function()
+				local wasRunning = State.Running
+				if State.Running then State.Running = false end
+
+				-- ── Resolve destination position ──────────────────────
+				local destPos
+				if destArg == "spawn" then
+					destPos = State.AltSpawnPlace
+
+				elseif destArg == "xyz" then
+					local x,y,z = tonumber(args[3]),tonumber(args[4]),tonumber(args[5])
+					if x and y and z then
+						destPos = Vector3.new(x,y,z)
+					else
+						log("tp: bad xyz coords","WARN")
+						if wasRunning and State.Role=="Alt" then startAltLoop() end
+						return
+					end
+
+				else
+					-- destArg is a player name
+					local dp = Players:FindFirstChild(destArg)
+					if dp and dp.Character then
+						local dhrp = dp.Character:FindFirstChild("HumanoidRootPart")
+						destPos = dhrp and (dhrp.Position + Vector3.new(0,4,0))
+					end
+					if not destPos then
+						log("tp: destination player '"..destArg.."' not found","WARN")
+						if wasRunning and State.Role=="Alt" then startAltLoop() end
+						return
+					end
+				end
+
+				-- ── Find the grab skill ───────────────────────────────
+				local si = findGrabSkillIndex()
+				if not si then
+					log("tp: no grab skill (Flowing Water / Lethal Whirlwind Stream) found","WARN")
+					if wasRunning and State.Role=="Alt" then startAltLoop() end
+					return
+				end
+
+				-- ── Find the victim ───────────────────────────────────
+				local victim = Players:FindFirstChild(victimName)
+				if not victim or not victim.Character then
+					log("tp: victim '"..victimName.."' not found or has no character","WARN")
+					if wasRunning and State.Role=="Alt" then startAltLoop() end
+					return
+				end
+
+				local vhrp = victim.Character:FindFirstChild("HumanoidRootPart")
+				if not vhrp then
+					log("tp: victim has no HumanoidRootPart","WARN")
+					if wasRunning and State.Role=="Alt" then startAltLoop() end
+					return
+				end
+
+				log("tp: grabbing "..victimName.." → sending to "..tostring(destPos),"ALT")
+
+				-- ── Step 1: Rapidly teleport behind victim and face them ──
+				-- Lock on for a brief moment so the grab registers properly
+				local locking = true
+				local lockThread = task.spawn(function()
+					while locking do
+						local vc = victim.Character
+						if not vc then break end
+						local vh = vc:FindFirstChild("HumanoidRootPart")
+						if not vh then break end
+						local vpos = vh.Position
+						teleportFacing(vpos + Vector3.new(0, 3, -3), vpos)
+						task.wait()
+					end
+				end)
+
+				task.wait(0.1)   -- one lock-on frame
+
+				-- ── Step 2: Fire the grab skill ───────────────────────
+				skill(si)
+
+				-- Keep tracking for 0.5 s so the grab animation connects
+				task.wait(0.5)
+				locking = false
+				task.cancel(lockThread)
+
+				-- ── Step 3: Teleport to destination — drag victim along ──
+				-- The grab skill holds the victim to our character, so warping
+				-- ourselves to destPos brings them with us.
+				teleportTo(destPos)
+				task.wait(0.1)
+
+				log("tp: delivered "..victimName.." to destination","ALT")
+
+				if wasRunning and State.Role=="Alt" then startAltLoop() end
+			end)
+		end
+
+	-- ── prefix {char} ─────────────────────────────────────────────
+	elseif cmd == "prefix" then
+		local newPfx = args[1] or ""
+		State.CmdPrefix = newPfx
+		log("Command prefix -> [" .. (newPfx == "" and "(none)" or newPfx) .. "]", "ALT")
 
 	-- ── help ─────────────────────────────────────────────────────
 	elseif cmd == "help" then
@@ -1822,16 +2122,29 @@ do
 
 	-- ── Chat Commands ─────────────────────────────────────────────
 	local cCC = card(p,38); section(cCC,"Chat Commands (from whitelisted farmer)",0)
-	lbl(cCC,"stopalt · startalt · restart · saveme · goto me",9,C.muted,false,1)
-	lbl(cCC,"kill/fling {name} · follow/unfollow {name}",9,C.muted,false,2)
-	lbl(cCC,"spawn {1-8|random} · spawn xyz X Y Z",9,C.muted,false,3)
-	lbl(cCC,"mode · m1delay · skilldel · antivoid · hitreset",9,C.muted,false,4)
-	lbl(cCC,"threatmode · threataction · reset · where · status · help",9,C.muted,false,5)
-	lbl(cCC,"Detects /e and /system prefixes automatically",9,C.accent,false,6)
-	local ccRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=7},cCC)
+	lbl(cCC,"stopalt · startalt · restart · reset · where · status",9,C.muted,false,1)
+	lbl(cCC,"saveme · goto me · kill/fling · follow/unfollow",9,C.muted,false,2)
+	lbl(cCC,"walkto/unwalkto · say {text} · trash {name}",9,C.muted,false,3)
+	lbl(cCC,"tp {victim} {target|spawn|xyz X Y Z}",9,C.muted,false,4)
+	lbl(cCC,"spawn {1-8|random} · spawn xyz X Y Z",9,C.muted,false,5)
+	lbl(cCC,"mode · m1delay · skilldel · antivoid · hitreset",9,C.muted,false,6)
+	lbl(cCC,"threatmode · threataction · prefix {char} · help",9,C.muted,false,7)
+	lbl(cCC,"Detects /e and /system prefixes automatically",9,C.accent,false,8)
+	local ccRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=10},cCC)
 	lbl(ccRow,"Enable Chat Commands",10,C.muted).Size=UDim2.new(1,-56,1,0)
 	local ccTog = makeToggle(ccRow,"OFF","ON",false,function(v) State.ChatCmdEnabled=v end)
 	ccTog.Position=UDim2.new(1,-52,0,1)
+	-- Prefix input
+	local pfxRow = mk("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,26),LayoutOrder=9},cCC)
+	lbl(pfxRow,"Command prefix (default: _)",10,C.muted).Size=UDim2.new(0.65,0,1,0)
+	local pfxBox = mk("TextBox",{Text=State.CmdPrefix,TextSize=11,TextColor3=C.text,
+		Font=Enum.Font.Gotham,BackgroundColor3=C.surface,ClearTextOnFocus=false,
+		Size=UDim2.new(0,55,0,24),Position=UDim2.new(1,-57,0,1),
+		TextXAlignment=Enum.TextXAlignment.Center},pfxRow)
+	corner(pfxBox,5); stroke(pfxBox,C.border)
+	pfxBox:GetPropertyChangedSignal("Text"):Connect(function() State.CmdPrefix=pfxBox.Text end)
+	pfxBox.Focused:Connect(function()   tw(pfxBox,FAST,{BackgroundColor3=C.cardH}) end)
+	pfxBox.FocusLost:Connect(function() tw(pfxBox,FAST,{BackgroundColor3=C.surface}) end)
 
 	-- ── Anti-Void (Alt) ───────────────────────────────────────────
 	local cAV = card(p,39); section(cAV,"Anti-Void",0)
